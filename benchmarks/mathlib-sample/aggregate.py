@@ -20,13 +20,15 @@ import statistics
 GROUPS = [
     ("kernel", "Kernel type checking", lambda c: c == "type checking"),
     ("typeclass", "Typeclass inference", lambda c: c.startswith("typeclass inference")),
+    ("linting", "Linting", lambda c: "lint" in c.lower() or c == "tacticAnalysis"),
+    ("waiting", "Blocked waiting on other threads", lambda c: c.startswith("blocked")),
     ("tactics", "Tactics and search",
-     lambda c: c in ("tactic execution", "simp", "congr simp thm", "dsimp")
-     or re.search(r"omega|grind|aesop|norm_num|linarith|positivity|ring|decide|simp", c) is not None),
+     lambda c: c in ("tactic execution", "congr simp thm")
+     or re.search(r"simp|omega|grind|aesop|norm_num|linarith|positivity|decide", c) is not None),
     ("interpretation", "Interpreted meta code (Mathlib's own tactics)", lambda c: c == "interpretation"),
     ("imports", "Imports and initialization", lambda c: c in ("import", "initialization")),
-    ("compilation", "Code generation", lambda c: c.startswith("compilation")),
-    ("linting", "Linting", lambda c: c == "linting"),
+    ("compilation", "Code generation and .olean output",
+     lambda c: c.startswith("compilation") or "serialization" in c),
     ("elaboration", "Other elaboration", lambda c: True),
 ]
 B = 10_000
@@ -101,7 +103,8 @@ def main():
     rp = [r for r in ok if r.get("replay", {}).get("ok")]
     res["replay_n"] = len(rp)
     res["replay_only_vs_elab_wall"] = boot([(r["replay"]["replay_only_s"], r["elab"]["wall_s"]) for r in rp], rng)
-    res["replay_process_vs_elab_cpu"] = boot([(r["replay"]["cpu_s"], r["elab"]["cpu_s"]) for r in rp], rng)
+    res["replay_with_imports_vs_elab_wall"] = boot(
+        [(r["replay"]["import_only_s"] + r["replay"]["replay_only_s"], r["elab"]["wall_s"]) for r in rp], rng)
     res["replay_only_vs_profiled_kernel"] = boot(
         [(r["replay"]["replay_only_s"], r["elab"]["categories"].get("type checking", 0.0)) for r in rp], rng)
 
@@ -159,7 +162,7 @@ def main():
         h1 = "fails (whole 95% interval above 10%)"
     else:
         h1 = "inconclusive (95% interval straddles 10%)"
-    e2r = res["replay_process_vs_elab_cpu"]
+    e2r = res["replay_with_imports_vs_elab_wall"]
     e2 = ("fails" if e2r["point"] > 0.30 else "passes") if e2r else "not measured"
     res["verdict"] = {"E1": e1, "H1_kernel_le_10pct": h1, "E2": e2}
 
@@ -185,8 +188,8 @@ def main():
     L.append("## E2: kernel-only replay\n")
     L.append(f"- Lean kernel replay of each module's own declarations, replay only / elaboration wall: "
              f"{pct(res['replay_only_vs_elab_wall'])}")
-    L.append(f"- Same, whole replay process CPU (incl. loading imports) / elaboration CPU: "
-             f"{pct(res['replay_process_vs_elab_cpu'])}")
+    L.append(f"- Same, including loading the module's imports from .olean files / elaboration wall: "
+             f"{pct(res['replay_with_imports_vs_elab_wall'])}")
     L.append(f"- Replay-only time / kernel time in the profiler: {pct(res['replay_only_vs_profiled_kernel'])}")
     cd = res["closure_decls"]
     L.append(f"- Dependency closures: {cd['n']} exported; median {cd['median']} declarations "
@@ -204,7 +207,7 @@ def main():
     L.append("\n## Verdict\n")
     L.append(f"- E1 (fails if kernel share > 50%): **{e1}**")
     L.append(f"- H1 (kernel ≤ 10%): **{h1}**")
-    L.append(f"- E2 (fails if replay > 30% of build): **{e2}**\n")
+    L.append(f"- E2 (fails if replay > 30% of build; replay including imports vs elaboration wall): **{e2}**\n")
     if res["failures"] or res["skipped_closure"]:
         L.append("## Steps that did not finish\n")
         for m, v in res["failures"].items():

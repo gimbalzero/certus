@@ -3,8 +3,6 @@
 name: Mathlib sample
 
 on:
-  push:
-    branches: [mathlib-sample]  # TEMP: dispatch needs the file on main
   workflow_dispatch:
     inputs:
       sample_size:
@@ -36,7 +34,7 @@ jobs:
     steps:
       - id: p
         env:
-          SHARDS: ${{ inputs.shards || '2' }}
+          SHARDS: ${{ inputs.shards || '20' }}
         run: |
           n=$(( SHARDS < 1 ? 1 : (SHARDS > 20 ? 20 : SHARDS) ))
           echo "shards=$(python3 -c "import json; print(json.dumps(list(range($n))))")" >> "$GITHUB_OUTPUT"
@@ -74,7 +72,7 @@ jobs:
       SHARD: ${{ matrix.shard }}
       SHARDS: ${{ strategy.job-total }}
       SEED: ${{ inputs.seed || '12' }}
-      SIZE: ${{ inputs.sample_size || '2' }}
+      SIZE: ${{ inputs.sample_size || '50' }}
     steps:
       - name: Free disk space
         run: |
@@ -147,7 +145,7 @@ jobs:
         env:
           META: >-
             {"mathlib": "${{ env.MATHLIB_REV }}", "lean": "v4.36.0", "seed": "${{ inputs.seed || '12' }}",
-            "sample_size": "${{ inputs.sample_size || '2' }}", "runner": "ubuntu-latest, 4 vCPU, 16 GB",
+            "sample_size": "${{ inputs.sample_size || '50' }}", "runner": "ubuntu-latest, 4 vCPU, 16 GB",
             "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}
         run: |
           mkdir -p out

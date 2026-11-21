@@ -135,6 +135,18 @@ def parse_profile(text):
     return cats
 
 
+def scan_inductives(path):
+    """Count inductive blocks in an export, and those Certus cannot check yet (nested)."""
+    blocks = nested = 0
+    with open(path, "rb") as f:
+        for line in f:
+            if line.startswith(b'{"inductive"'):
+                blocks += 1
+                if any(int(n) > 0 for n in re.findall(rb'"numNested":(\d+)', line)):
+                    nested += 1
+    return {"inductive_blocks": blocks, "nested_inductive_blocks": nested}
+
+
 def lake_env(mathlib):
     """The environment `lake env` gives commands inside the Mathlib checkout."""
     out = subprocess.run(
@@ -229,6 +241,8 @@ def measure(mod, a, env, deadline, scratch):
         r = run([certus, "extract", export, cert, *roots], scratch, env, a.export_timeout)
         m = re.search(r"wrote (\d+) declarations", r["_stdout"])
         r["decls"] = int(m.group(1)) if m else None
+        if r["ok"]:
+            r.update(scan_inductives(cert))
         rec["certus_extract"] = clean(r)
         os.remove(export)
         if r["ok"] and deadline - time.time() > a.closure_reserve / 2:
