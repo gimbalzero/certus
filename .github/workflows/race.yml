@@ -60,6 +60,8 @@ jobs:
             ~/tools/lean4lean/.lake
             ~/tools/cargo
           key: race-tools-${{ runner.os }}-${{ env.LEAN_TOOLCHAIN }}-${{ env.LEAN4EXPORT_REV }}-${{ env.CONLECHE_REV }}-${{ env.LEAN4LEAN_REV }}-${{ hashFiles('benchmarks/race/lean4lean/**') }}-${{ env.NANODA_REV }}
+          # Lake and cargo rebuild only what changed, so an older cache is a good start.
+          restore-keys: race-tools-${{ runner.os }}-${{ env.LEAN_TOOLCHAIN }}-
 
       - name: lean4export (from source)
         run: |
