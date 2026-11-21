@@ -8,10 +8,12 @@
 
 use crate::env::{ConstInfo, Kind, RecRule};
 use crate::tc::{R, TC};
-use crate::term::{E, L, Level, Node};
+use crate::term::{E, L, Level, Node, Store};
 use certus_core::export::{Name, NameId};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct IndType {
     pub name: NameId,
     pub lparams: Vec<NameId>,
@@ -26,6 +28,7 @@ pub struct IndType {
     pub is_reflexive: bool,
 }
 
+#[derive(Clone)]
 pub struct Ctor {
     pub name: NameId,
     pub lparams: Vec<NameId>,
@@ -37,6 +40,7 @@ pub struct Ctor {
     pub is_unsafe: bool,
 }
 
+#[derive(Clone)]
 pub struct Rec {
     pub name: NameId,
     pub lparams: Vec<NameId>,
@@ -59,16 +63,31 @@ pub struct Block {
 
 struct Checker<'b, 'a> {
     tc: &'b mut TC<'a>,
-    names: &'b [Name],
+    /// The block being checked: the declared types followed by the
+    /// auxiliary types that replace nested occurrences (see `Nested`).
     blk: &'b Block,
+    /// The block as exported.
+    orig: &'b Block,
+    nested: &'b Nested,
     np: usize,
     params: Vec<E>,
     levels: Vec<L>,
     result_level: L,
+    /// Names of every type in `blk`, auxiliary ones included.
     ind_names: Vec<NameId>,
+    /// Names of the declared types (the `all` field of every constant).
+    orig_names: Vec<NameId>,
 }
 
 /// Check a block and return every constant it defines.
+///
+/// Nested inductive types are handled as in Lean 4's kernel (`elim_nested_inductive_fn`
+/// and `environment::add_inductive`): every nested occurrence `J Ds` (an existing
+/// inductive type applied to parameters that mention the block) is replaced by an
+/// auxiliary type whose constructors are `J`'s, instantiated at `Ds`. The resulting
+/// mutual block is checked, its recursors are generated, and the auxiliary types are
+/// translated back (`aux As` to `J Ds`, `aux.c As` to `J.c Ds`) before the comparison
+/// with the exported recursors, the auxiliary ones being `T.rec_1`, `T.rec_2`, ...
 pub fn check_block(tc: &mut TC, names: &[Name], blk: &Block) -> R<Vec<(NameId, ConstInfo)>> {
     let Some(first) = blk.types.first() else { return Err("inductive block with no types".into()) };
     if blk.types.iter().any(|t| t.is_unsafe)
@@ -77,44 +96,561 @@ pub fn check_block(tc: &mut TC, names: &[Name], blk: &Block) -> R<Vec<(NameId, C
     {
         return Err("unsafe inductive types are not accepted".into());
     }
-    if blk.types.iter().any(|t| t.num_nested > 0) {
-        return Err("nested inductive types are not supported yet".into());
-    }
     let lparams = first.lparams.clone();
     check_distinct(&lparams)?;
     if blk.types.iter().any(|t| t.lparams != lparams) || blk.ctors.iter().any(|c| c.lparams != lparams) {
         return Err("inductive block with inconsistent universe parameters".into());
     }
     tc.lparams = lparams.clone();
-    let ind_names: Vec<NameId> = blk.types.iter().map(|t| t.name).collect();
+    let orig_names: Vec<NameId> = blk.types.iter().map(|t| t.name).collect();
     for t in &blk.types {
-        if t.all != ind_names {
+        if t.all != orig_names {
             return Err("inductive `all` list does not match the block".into());
         }
         if t.num_params != first.num_params {
             return Err("inductive types in a block disagree on parameters".into());
         }
     }
+    let np = first.num_params as usize;
     let levels: Vec<L> = lparams.iter().map(|&p| tc.st.level(Level::Param(p))).collect();
+    check_uniform_ind_occs(tc.st, blk, np, &levels)?;
+
+    // Eliminate nested occurrences.
+    let mut el = Elim {
+        tc: &mut *tc,
+        np,
+        levels: levels.clone(),
+        next_name: u32::try_from(names.len()).map_err(|_| "too many names")?,
+        params: Vec::new(),
+        block_names: orig_names.clone(),
+        aux: Vec::new(),
+    };
+    let aux_blk = el.run(blk)?;
+    let nested = el.finish();
+    if blk.types.iter().any(|t| t.num_nested as usize != nested.aux.len()) {
+        return Err("inductive metadata (numNested) is wrong".into());
+    }
+    let aux_blk = Block { recs: order_recs(names, blk, nested.aux.len())?, ..aux_blk };
+
+    let ind_names: Vec<NameId> = aux_blk.types.iter().map(|t| t.name).collect();
     let mut c = Checker {
-        tc,
-        names,
-        blk,
-        np: first.num_params as usize,
+        tc: &mut *tc,
+        blk: &aux_blk,
+        orig: blk,
+        nested: &nested,
+        np,
         params: Vec::new(),
         levels,
         result_level: L(0),
         ind_names,
+        orig_names,
     };
     c.check_types()?;
     c.check_ctors()?;
-    c.check_recs()
+    let out = c.check_recs()?;
+    if !nested.aux.is_empty() {
+        recheck_nested(tc, &nested, &lparams, &out)?;
+    }
+    Ok(out)
 }
 
 fn check_distinct(ps: &[NameId]) -> R<()> {
     for (i, p) in ps.iter().enumerate() {
         if ps[..i].contains(p) {
             return Err("duplicate universe parameter".into());
+        }
+    }
+    Ok(())
+}
+
+/// Every occurrence of a type of the block in a constructor type must be applied
+/// to the block's universe levels and parameters (Lean's `check_uniform_ind_occs`).
+/// This is checked syntactically, before anything is reduced or the parametric
+/// arguments of nested occurrences are set aside.
+fn check_uniform_ind_occs(st: &Store, blk: &Block, np: usize, levels: &[L]) -> R<()> {
+    let names: Vec<NameId> = blk.types.iter().map(|t| t.name).collect();
+    let mut seen = FxHashSet::default();
+    for c in &blk.ctors {
+        let mut stack = vec![(c.ty, 0u32)];
+        while let Some((e, off)) = stack.pop() {
+            if !seen.insert((e, off)) {
+                continue;
+            }
+            let (h, args) = st.spine(e);
+            if let Node::Const(n, ls) = st.node(h)
+                && names.contains(&n)
+                && args.len() <= np
+            {
+                let ok = args.len() == np
+                    && off as usize >= np
+                    && st.list_of(ls) == levels
+                    && args.iter().enumerate().all(|(i, &a)| st.node(a) == Node::BVar(off - 1 - i as u32));
+                if !ok {
+                    return Err("invalid occurrence of a type being declared: it must be applied to the parameters \
+                                and universe levels of the block"
+                        .into());
+                }
+                continue;
+            }
+            match st.node(e) {
+                Node::App(f, a) => stack.extend([(f, off), (a, off)]),
+                Node::Lam(d, b) | Node::Pi(d, b) => stack.extend([(d, off), (b, off + 1)]),
+                Node::Let(t, v, b) => stack.extend([(t, off), (v, off), (b, off + 1)]),
+                Node::Proj(_, _, x) => stack.push((x, off)),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An auxiliary type standing for the nested occurrence `key = J Ds`.
+struct Aux {
+    name: NameId,
+    /// `J Ds`, over the free variables `Nested::params`.
+    key: E,
+    /// `J Ds` with the parameters abstracted (loose bound variables).
+    key_abs: E,
+    ty: E,
+    /// Auxiliary constructor name, the constructor of `J` it copies, and its type.
+    ctors: Vec<(NameId, NameId, E)>,
+}
+
+/// The result of eliminating nested occurrences.
+struct Nested {
+    np: usize,
+    params: Vec<E>,
+    aux: Vec<Aux>,
+    /// Auxiliary constructor to (constructor of `J`, auxiliary type index).
+    aux_ctor: FxHashMap<NameId, (NameId, usize)>,
+    /// Auxiliary type name to its index.
+    aux_index: FxHashMap<NameId, usize>,
+}
+
+struct Elim<'b, 'a> {
+    tc: &'b mut TC<'a>,
+    np: usize,
+    levels: Vec<L>,
+    /// Auxiliary names are numbered past the export's names, so no declaration
+    /// can mention them.
+    next_name: NameId,
+    params: Vec<E>,
+    block_names: Vec<NameId>,
+    aux: Vec<Aux>,
+}
+
+impl Elim<'_, '_> {
+    fn fresh_name(&mut self) -> R<NameId> {
+        let n = self.next_name;
+        self.next_name = n.checked_add(1).ok_or("too many names")?;
+        Ok(n)
+    }
+
+    /// Open the first `np` binders of `ty` as free variables (domains as written).
+    fn open_params(&mut self, mut ty: E) -> R<(Vec<E>, E)> {
+        let mut xs = Vec::new();
+        for _ in 0..self.np {
+            let Node::Pi(d, b) = self.tc.st.node(ty) else {
+                return Err("invalid inductive declaration: fewer binders than parameters".into());
+            };
+            let x = self.tc.fresh_fvar(d, None);
+            xs.push(x);
+            ty = self.tc.st.instantiate_rev(b, &[x]);
+        }
+        Ok((xs, ty))
+    }
+
+    fn fvar_ids(&self, xs: &[E]) -> Vec<u32> {
+        xs.iter()
+            .map(|&x| match self.tc.st.node(x) {
+                Node::FVar(i) => i,
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    /// `e` with the free variables `xs` replaced by the block's parameters.
+    fn replace_params(&mut self, e: E, xs: &[E]) -> E {
+        let ids = self.fvar_ids(xs);
+        let a = self.tc.st.abstract_fvars(e, &ids);
+        let ps = self.params.clone();
+        self.tc.st.instantiate_rev(a, &ps)
+    }
+
+    /// Instantiate the first `n` (syntactic) binders of `e` with `args`.
+    fn instantiate_pi_params(&mut self, mut e: E, args: &[E]) -> R<E> {
+        for _ in 0..args.len() {
+            let Node::Pi(_, b) = self.tc.st.node(e) else {
+                return Err("invalid nested inductive datatype, ill-formed declaration".into());
+            };
+            e = b;
+        }
+        Ok(self.tc.st.instantiate_rev(e, args))
+    }
+
+    fn run(&mut self, blk: &Block) -> R<Block> {
+        let (params, _) = self.open_params(blk.types[0].ty)?;
+        self.params = params;
+        let mut ctors = Vec::with_capacity(blk.ctors.len());
+        for c in &blk.ctors {
+            let ty = self.replace_in_ctor(c.ty)?;
+            ctors.push(Ctor { ty, ..c.clone() });
+        }
+        let mut q = 0;
+        while q < self.aux.len() {
+            for k in 0..self.aux[q].ctors.len() {
+                let ty = self.replace_in_ctor(self.aux[q].ctors[k].2)?;
+                self.aux[q].ctors[k].2 = ty;
+            }
+            q += 1;
+        }
+        // Assemble the auxiliary mutual block.
+        let first = &blk.types[0];
+        let all: Vec<NameId> = self.block_names.clone();
+        let mut types: Vec<IndType> = blk.types.clone();
+        for a in &self.aux {
+            types.push(IndType {
+                name: a.name,
+                lparams: first.lparams.clone(),
+                ty: a.ty,
+                num_params: first.num_params,
+                num_indices: count_pis(self.tc.st, a.ty).saturating_sub(self.np) as u32,
+                all: all.clone(),
+                ctors: a.ctors.iter().map(|c| c.0).collect(),
+                num_nested: first.num_nested,
+                is_rec: first.is_rec,
+                is_unsafe: false,
+                is_reflexive: first.is_reflexive,
+            });
+            for (cidx, &(cname, _, cty)) in a.ctors.iter().enumerate() {
+                ctors.push(Ctor {
+                    name: cname,
+                    lparams: first.lparams.clone(),
+                    ty: cty,
+                    induct: a.name,
+                    cidx: cidx as u32,
+                    num_params: first.num_params,
+                    num_fields: count_pis(self.tc.st, cty).saturating_sub(self.np) as u32,
+                    is_unsafe: false,
+                });
+            }
+        }
+        Ok(Block { types, ctors, recs: Vec::new() })
+    }
+
+    fn finish(self) -> Nested {
+        let mut aux_ctor = FxHashMap::default();
+        let mut aux_index = FxHashMap::default();
+        for (i, a) in self.aux.iter().enumerate() {
+            aux_index.insert(a.name, i);
+            for &(c, jc, _) in &a.ctors {
+                aux_ctor.insert(c, (jc, i));
+            }
+        }
+        Nested { np: self.np, params: self.params, aux: self.aux, aux_ctor, aux_index }
+    }
+
+    /// Replace every nested occurrence in a constructor type. The parameters are
+    /// re-opened for each constructor, as in Lean.
+    fn replace_in_ctor(&mut self, cty: E) -> R<E> {
+        let (xs, body) = self.open_params(cty)?;
+        let mut memo = FxHashMap::default();
+        let body = self.replace_all(body, &xs, &mut memo)?;
+        Ok(self.tc.bind(true, &xs, body))
+    }
+
+    /// Top-down replacement (Lean's `replace`): a replaced term is not visited further.
+    fn replace_all(&mut self, e: E, xs: &[E], memo: &mut FxHashMap<E, E>) -> R<E> {
+        if let Some(&r) = memo.get(&e) {
+            return Ok(r);
+        }
+        let r = if let Some(r) = self.replace_if_nested(e, xs)? {
+            r
+        } else {
+            match self.tc.st.node(e) {
+                Node::App(f, a) => {
+                    let f = self.replace_all(f, xs, memo)?;
+                    let a = self.replace_all(a, xs, memo)?;
+                    self.tc.st.app(f, a)
+                }
+                Node::Lam(d, b) => {
+                    let d = self.replace_all(d, xs, memo)?;
+                    let b = self.replace_all(b, xs, memo)?;
+                    self.tc.st.mk(Node::Lam(d, b))
+                }
+                Node::Pi(d, b) => {
+                    let d = self.replace_all(d, xs, memo)?;
+                    let b = self.replace_all(b, xs, memo)?;
+                    self.tc.st.mk(Node::Pi(d, b))
+                }
+                Node::Let(t, v, b) => {
+                    let t = self.replace_all(t, xs, memo)?;
+                    let v = self.replace_all(v, xs, memo)?;
+                    let b = self.replace_all(b, xs, memo)?;
+                    self.tc.st.mk(Node::Let(t, v, b))
+                }
+                Node::Proj(s, i, x) => {
+                    let x = self.replace_all(x, xs, memo)?;
+                    self.tc.st.mk(Node::Proj(s, i, x))
+                }
+                _ => e,
+            }
+        };
+        memo.insert(e, r);
+        Ok(r)
+    }
+
+    /// If `e` is a nested occurrence `I Ds is`, return `Iaux xs is`, creating
+    /// auxiliary types for every type of `I`'s block on first sight.
+    fn replace_if_nested(&mut self, e: E, xs: &[E]) -> R<Option<E>> {
+        if !matches!(self.tc.st.node(e), Node::App(..)) {
+            return Ok(None);
+        }
+        let (h, args) = self.tc.st.spine(e);
+        let Node::Const(i_name, i_ls) = self.tc.st.node(h) else { return Ok(None) };
+        // Only previously declared inductive types can be nested.
+        let Some(info) = self.tc.env.get(i_name) else { return Ok(None) };
+        let Kind::Induct { num_params, all: i_all, .. } = &info.kind else { return Ok(None) };
+        let inp = *num_params as usize;
+        if inp > args.len() {
+            return Ok(None);
+        }
+        let mut is_nested = false;
+        let mut loose = false;
+        for &a in &args[..inp] {
+            loose |= self.tc.st.info(a).lbr != 0;
+            is_nested |= self.tc.st.mentions_const(a, &self.block_names);
+        }
+        if !is_nested {
+            return Ok(None);
+        }
+        if loose {
+            return Err(
+                "invalid nested inductive datatype: nested inductive datatypes parameters cannot contain local variables"
+                    .into(),
+            );
+        }
+        let i_lvls: Vec<L> = self.tc.st.list_of(i_ls).to_vec();
+        let ias = self.tc.st.apps(h, &args[..inp]);
+        let iparams = self.replace_params(ias, xs);
+        let lv = self.levels.clone();
+        let make = |el: &mut Self, aux: NameId| {
+            let c = el.tc.st.cnst(aux, &lv);
+            let c = el.tc.st.apps(c, xs);
+            el.tc.st.apps(c, &args[inp..])
+        };
+        if let Some(a) = self.aux.iter().find(|a| a.key == iparams) {
+            let n = a.name;
+            return Ok(Some(make(self, n)));
+        }
+        let mut result = None;
+        for &j_name in i_all.clone().iter() {
+            let j_info = self.tc.env.get(j_name).ok_or("nested inductive datatype: unknown type in its block")?;
+            let Kind::Induct { ctors: j_ctors, .. } = &j_info.kind else {
+                return Err("nested inductive datatype: its block contains a non-inductive constant".into());
+            };
+            if j_info.lparams.len() != i_lvls.len() {
+                return Err("nested inductive datatype: wrong number of universe levels".into());
+            }
+            let j = self.tc.st.cnst(j_name, &i_lvls);
+            let jas = self.tc.st.apps(j, &args[..inp]);
+            let aux_name = self.fresh_name()?;
+            let mut aux_ty = self.tc.st.instantiate_lparams(j_info.ty, &j_info.lparams, &i_lvls);
+            aux_ty = self.instantiate_pi_params(aux_ty, &args[..inp])?;
+            aux_ty = self.tc.bind(true, xs, aux_ty);
+            let key = self.replace_params(jas, xs);
+            let pids = self.fvar_ids(&self.params.clone());
+            let key_abs = self.tc.st.abstract_fvars(key, &pids);
+            if j_name == i_name {
+                result = Some(make(self, aux_name));
+            }
+            let mut ctors = Vec::new();
+            for &jc in j_ctors {
+                let c_info = self.tc.env.get(jc).ok_or("nested inductive datatype: unknown constructor")?;
+                if !matches!(c_info.kind, Kind::Ctor { .. }) || c_info.lparams.len() != i_lvls.len() {
+                    return Err("nested inductive datatype: ill-formed constructor".into());
+                }
+                let c_name = self.fresh_name()?;
+                let mut cty = self.tc.st.instantiate_lparams(c_info.ty, &c_info.lparams, &i_lvls);
+                cty = self.instantiate_pi_params(cty, &args[..inp])?;
+                cty = self.tc.bind(true, xs, cty);
+                ctors.push((c_name, jc, cty));
+            }
+            self.block_names.push(aux_name);
+            self.aux.push(Aux { name: aux_name, key, key_abs, ty: aux_ty, ctors });
+        }
+        result.map(Some).ok_or_else(|| "nested inductive datatype: type missing from its own block".into())
+    }
+}
+
+fn count_pis(st: &Store, mut e: E) -> usize {
+    let mut n = 0;
+    while let Node::Pi(_, b) = st.node(e) {
+        e = b;
+        n += 1;
+    }
+    n
+}
+
+/// The exported recursors in block order: `T.rec` for each declared type `T`,
+/// then `T₀.rec_1`, `T₀.rec_2`, ... (named after the first type) for the
+/// auxiliary types, as in Lean's `mk_aux_rec_name_map`.
+fn order_recs(names: &[Name], blk: &Block, n_aux: usize) -> R<Vec<Rec>> {
+    if blk.recs.len() != blk.types.len() + n_aux {
+        return Err("expected one recursor per inductive type (auxiliary types included)".into());
+    }
+    let is = |r: &Rec, pre: NameId, s: &str| matches!(&names[r.name as usize], Name::Str { pre: p, s: q } if *p == pre && q == s);
+    let mut out = Vec::new();
+    for t in &blk.types {
+        let r = blk.recs.iter().find(|r| is(r, t.name, "rec")).ok_or("recursor has an unexpected name")?;
+        out.push(r.clone());
+    }
+    let main = blk.types[0].name;
+    for i in 1..=n_aux {
+        let s = format!("rec_{i}");
+        let r = blk.recs.iter().find(|r| is(r, main, &s)).ok_or("recursor has an unexpected name")?;
+        out.push(r.clone());
+    }
+    Ok(out)
+}
+
+impl Nested {
+    /// Translate a term of the auxiliary block back (Lean's `restore_nested`):
+    /// `aux As is` becomes `J Ds is` and `aux.c As fs` becomes `J.c Ds fs`, where
+    /// `As` are the term's own leading `np` binders.
+    fn restore(&self, tc: &mut TC, e: E) -> R<E> {
+        if self.aux.is_empty() {
+            return Ok(e);
+        }
+        let pi = matches!(tc.st.node(e), Node::Pi(..));
+        let mut body = e;
+        let mut xs = Vec::with_capacity(self.np);
+        for _ in 0..self.np {
+            let (Node::Pi(d, b) | Node::Lam(d, b)) = tc.st.node(body) else {
+                return Err("failed to restore nested inductive types, fewer binders than parameters".into());
+            };
+            let x = tc.fresh_fvar(d, None);
+            xs.push(x);
+            body = tc.st.instantiate_rev(b, &[x]);
+        }
+        let mut memo = FxHashMap::default();
+        let body = self.restore_go(tc, body, &xs, &mut memo)?;
+        Ok(tc.bind(pi, &xs, body))
+    }
+
+    fn restore_go(&self, tc: &mut TC, t: E, xs: &[E], memo: &mut FxHashMap<E, E>) -> R<E> {
+        if let Some(&r) = memo.get(&t) {
+            return Ok(r);
+        }
+        let (h, args) = tc.st.spine(t);
+        if let Node::Const(n, _) = tc.st.node(h) {
+            if let Some(&i) = self.aux_index.get(&n) {
+                if args.len() < self.np {
+                    return Err(
+                        "failed to restore nested inductive types, auxiliary type is not applied to all parameters"
+                            .into(),
+                    );
+                }
+                let new_t = tc.st.instantiate_rev(self.aux[i].key_abs, xs);
+                let r = tc.st.apps(new_t, &args[self.np..]);
+                memo.insert(t, r);
+                return Ok(r);
+            }
+            if let Some(&(jc, i)) = self.aux_ctor.get(&n) {
+                if args.len() < self.np {
+                    return Err(
+                        "failed to restore nested inductive types, auxiliary constructor is not applied to all parameters"
+                            .into(),
+                    );
+                }
+                let nested = tc.st.instantiate_rev(self.aux[i].key_abs, xs);
+                let (ih, i_args) = tc.st.spine(nested);
+                let Node::Const(_, i_ls) = tc.st.node(ih) else {
+                    return Err("failed to restore nested inductive types, nested occurrence is not an inductive type application".into());
+                };
+                let lv: Vec<L> = tc.st.list_of(i_ls).to_vec();
+                let f = tc.st.cnst(jc, &lv);
+                let f = tc.st.apps(f, &i_args);
+                let r = tc.st.apps(f, &args[self.np..]);
+                memo.insert(t, r);
+                return Ok(r);
+            }
+        }
+        let r = match tc.st.node(t) {
+            Node::App(f, a) => {
+                let f = self.restore_go(tc, f, xs, memo)?;
+                let a = self.restore_go(tc, a, xs, memo)?;
+                tc.st.app(f, a)
+            }
+            Node::Lam(d, b) => {
+                let d = self.restore_go(tc, d, xs, memo)?;
+                let b = self.restore_go(tc, b, xs, memo)?;
+                tc.st.mk(Node::Lam(d, b))
+            }
+            Node::Pi(d, b) => {
+                let d = self.restore_go(tc, d, xs, memo)?;
+                let b = self.restore_go(tc, b, xs, memo)?;
+                tc.st.mk(Node::Pi(d, b))
+            }
+            Node::Let(ty, v, b) => {
+                let ty = self.restore_go(tc, ty, xs, memo)?;
+                let v = self.restore_go(tc, v, xs, memo)?;
+                let b = self.restore_go(tc, b, xs, memo)?;
+                tc.st.mk(Node::Let(ty, v, b))
+            }
+            Node::Proj(s, i, x) => {
+                let x = self.restore_go(tc, x, xs, memo)?;
+                tc.st.mk(Node::Proj(s, i, x))
+            }
+            _ => t,
+        };
+        memo.insert(t, r);
+        Ok(r)
+    }
+
+    /// The constructor a rule of an auxiliary recursor is for, translated back.
+    fn restore_ctor_name(&self, c: NameId) -> NameId {
+        self.aux_ctor.get(&c).map_or(c, |&(jc, _)| jc)
+    }
+
+    /// The inductive type of the major premise of the recursor of type `ti`.
+    fn major_induct(&self, tc: &TC, n_orig: usize, ti: usize, own: NameId) -> NameId {
+        if ti < n_orig {
+            return own;
+        }
+        match tc.st.node(tc.st.head(self.aux[ti - n_orig].key)) {
+            Node::Const(n, _) => n,
+            _ => unreachable!("auxiliary keys are constant applications"),
+        }
+    }
+}
+
+/// Lean re-checks, in an environment without the auxiliary types, the nested
+/// occurrences `J Ds` (whose parametric arguments do not otherwise appear in
+/// the auxiliary block) and everything the translation back produced.
+fn recheck_nested(tc: &mut TC, nested: &Nested, lparams: &[NameId], out: &[(NameId, ConstInfo)]) -> R<()> {
+    let keys: Vec<E> = nested.aux.iter().map(|a| tc.bind(false, &nested.params, a.key)).collect();
+    let mut tc2 = TC::new(&mut *tc.st, tc.env, lparams.to_vec());
+    for (n, info) in out {
+        tc2.local.insert(*n, Arc::new(info.clone()));
+    }
+    // `J Ds` need not be a type: `J` may have indices.
+    for k in keys {
+        tc2.infer(k, true)?;
+    }
+    for (_, info) in out {
+        tc2.lparams = info.lparams.clone();
+        match &info.kind {
+            Kind::Ctor { .. } | Kind::Rec { .. } => {
+                let s = tc2.infer(info.ty, true)?;
+                tc2.ensure_sort(s)?;
+            }
+            _ => {}
+        }
+        if let Kind::Rec { rules, .. } = &info.kind {
+            for r in rules {
+                tc2.infer(r.rhs, true)?;
+            }
         }
     }
     Ok(())
@@ -215,6 +751,10 @@ impl Checker<'_, '_> {
             return None;
         }
         if args[..self.np] != self.params[..] {
+            return None;
+        }
+        // Indices must not mention the types being declared (lean4#2125).
+        if args[self.np..].iter().any(|&a| self.has_ind_occ(a)) {
             return None;
         }
         Some(ti)
@@ -385,9 +925,7 @@ impl Checker<'_, '_> {
 
     fn check_recs(&mut self) -> R<Vec<(NameId, ConstInfo)>> {
         let blk = self.blk;
-        if blk.recs.len() != blk.types.len() {
-            return Err("expected one recursor per inductive type".into());
-        }
+        let n_orig = self.orig.types.len();
         // Universe of the motive.
         let elim_zero = self.elim_only_at_zero()?;
         let rec_lparams = blk.recs[0].lparams.clone();
@@ -483,14 +1021,13 @@ impl Checker<'_, '_> {
             }
         }
 
-        let all: Vec<NameId> = self.ind_names.clone();
+        let all: Vec<NameId> = self.orig_names.clone();
+        let nested = self.nested;
         let mut out = Vec::new();
         let mut minor_idx = 0usize;
         for (ti, t) in blk.types.iter().enumerate() {
+            // `check_block` put the exported recursors in block order, by name.
             let r = &blk.recs[ti];
-            if !self.is_rec_name(r.name, t.name) {
-                return Err("recursor has an unexpected name".into());
-            }
             if r.lparams != rec_lparams {
                 return Err("recursors in a block disagree on universe parameters".into());
             }
@@ -503,6 +1040,7 @@ impl Checker<'_, '_> {
             ty = self.tc.bind(true, &motives, ty);
             let params = self.params.clone();
             ty = self.tc.bind(true, &params, ty);
+            let ty = nested.restore(self.tc, ty)?;
             if ty != r.ty {
                 let d = self.tc.st.first_difference(ty, r.ty).unwrap_or_default();
                 return Err(format!(
@@ -536,13 +1074,21 @@ impl Checker<'_, '_> {
                 rhs = self.tc.bind(false, &minors, rhs);
                 rhs = self.tc.bind(false, &motives, rhs);
                 rhs = self.tc.bind(false, &params, rhs);
-                rules.push(RecRule { ctor: cname, nfields: fields.len() as u32, rhs });
+                let rhs = nested.restore(self.tc, rhs)?;
+                let ctor = nested.restore_ctor_name(cname);
+                rules.push(RecRule { ctor, nfields: fields.len() as u32, rhs });
                 minor_idx += 1;
             }
-            if r.rules.len() != rules.len()
-                || r.rules.iter().zip(&rules).any(|(a, b)| a.ctor != b.ctor || a.nfields != b.nfields || a.rhs != b.rhs)
-            {
-                return Err("recursor rules do not match the ones generated from the inductive".into());
+            if r.rules.len() != rules.len() {
+                return Err("recursor rules do not match the ones generated from the inductive (wrong number)".into());
+            }
+            for (a, b) in r.rules.iter().zip(&rules) {
+                if a.ctor != b.ctor || a.nfields != b.nfields || a.rhs != b.rhs {
+                    let d = self.tc.st.first_difference(b.rhs, a.rhs).unwrap_or_default();
+                    return Err(format!(
+                        "recursor rules do not match the ones generated from the inductive (generated vs exported: {d})"
+                    ));
+                }
             }
             if r.num_params as usize != self.np
                 || r.num_indices != t.num_indices
@@ -559,7 +1105,7 @@ impl Checker<'_, '_> {
                     lparams: r.lparams.clone(),
                     ty: r.ty,
                     kind: Kind::Rec {
-                        major_induct: t.name,
+                        major_induct: nested.major_induct(self.tc, n_orig, ti, t.name),
                         num_params: r.num_params,
                         num_indices: r.num_indices,
                         num_motives: r.num_motives,
@@ -591,18 +1137,25 @@ impl Checker<'_, '_> {
             return Err("inductive metadata (isRec / isReflexive) is wrong".into());
         }
 
+        // The declared types and their constructors, translated back. Lean adds the
+        // translated constructor types; they must be the exported ones.
         let mut result = Vec::new();
-        for t in &blk.types {
+        for t in &self.orig.types {
             result.push((t.name, (*self.tc.local[&t.name]).clone()));
         }
-        for c in &blk.ctors {
-            result.push((c.name, (*self.tc.local[&c.name]).clone()));
+        for (k, c) in self.orig.ctors.iter().enumerate() {
+            let ty = nested.restore(self.tc, blk.ctors[k].ty)?;
+            if ty != c.ty {
+                let d = self.tc.st.first_difference(ty, c.ty).unwrap_or_default();
+                return Err(format!(
+                    "constructor type does not survive the translation back from the auxiliary block ({d})"
+                ));
+            }
+            let kind =
+                Kind::Ctor { induct: c.induct, cidx: c.cidx, num_params: c.num_params, num_fields: c.num_fields };
+            result.push((c.name, ConstInfo { lparams: c.lparams.clone(), ty: c.ty, kind }));
         }
         result.extend(out);
         Ok(result)
-    }
-
-    fn is_rec_name(&self, rec: NameId, ind: NameId) -> bool {
-        matches!(&self.names[rec as usize], Name::Str { pre, s } if *pre == ind && s == "rec")
     }
 }
