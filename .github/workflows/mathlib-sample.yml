@@ -1,0 +1,158 @@
+# E1/E2 (issue #12): profile a random sample of Mathlib modules and time kernel-only
+# replays of them, on free GitHub-hosted runners. See benchmarks/mathlib-sample/README.md.
+name: Mathlib sample
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample_size:
+        description: Number of Mathlib modules to sample
+        default: "50"
+      shards:
+        description: Number of parallel runners (at most 20)
+        default: "20"
+      seed:
+        description: Random seed for the sample
+        default: "12"
+
+permissions:
+  contents: read
+
+env:
+  # Mathlib tag v4.36.0, built with leanprover/lean4:v4.36.0.
+  MATHLIB_REV: fc4f59e577feb1a4956671bc04ac18aaaf8cd842
+  # lean4export v4.36.0-rc1 tag (format 3.x); rebuilt against Mathlib's toolchain.
+  LEAN4EXPORT_REV: df81913eee5519d5a88ae5b0fd701b5298cc29ab
+  # nanoda_lib master, 0.4.32.
+  NANODA_REV: 0da9f98feadd3a0a2ef4b3dbcf52a298a6fef929
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.p.outputs.shards }}
+    steps:
+      - id: p
+        env:
+          SHARDS: ${{ inputs.shards || '20' }}
+        run: |
+          n=$(( SHARDS < 1 ? 1 : (SHARDS > 20 ? 20 : SHARDS) ))
+          echo "shards=$(python3 -c "import json; print(json.dumps(list(range($n))))")" >> "$GITHUB_OUTPUT"
+
+  tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build certus
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo build --release -p certus-cli
+      - name: Build nanoda
+        run: |
+          git clone -q https://github.com/ammkrn/nanoda_lib "$RUNNER_TEMP/nanoda"
+          git -C "$RUNNER_TEMP/nanoda" checkout -q "$NANODA_REV"
+          (cd "$RUNNER_TEMP/nanoda" && cargo +stable build --release --bin nanoda_bin)
+      - run: |
+          mkdir -p tools
+          cp target/release/certus "$RUNNER_TEMP/nanoda/target/release/nanoda_bin" tools/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tools
+          path: tools/
+
+  shard:
+    needs: [plan, tools]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    env:
+      SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ strategy.job-total }}
+      SEED: ${{ inputs.seed || '12' }}
+      SIZE: ${{ inputs.sample_size || '50' }}
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /opt/microsoft
+          sudo docker image prune -af > /dev/null || true
+          df -h /
+          nproc; free -g
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: tools
+          path: ${{ runner.temp }}/tools
+      - name: Install elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Check out Mathlib
+        run: |
+          git init -q "$RUNNER_TEMP/mathlib"
+          cd "$RUNNER_TEMP/mathlib"
+          git fetch -q --depth 1 https://github.com/leanprover-community/mathlib4 "$MATHLIB_REV"
+          git checkout -q FETCH_HEAD
+          cat lean-toolchain
+      - name: Pick this shard's modules
+        run: |
+          python3 benchmarks/mathlib-sample/sample.py "$RUNNER_TEMP/mathlib" \
+            --seed "$SEED" --size "$SIZE" --shard "$SHARD" --shards "$SHARDS" > "$RUNNER_TEMP/modules.txt"
+          cat "$RUNNER_TEMP/modules.txt"
+      - name: Fetch the Mathlib cache for these modules only
+        working-directory: ${{ runner.temp }}/mathlib
+        run: |
+          files=$(sed 's|\.|/|g; s|$|.lean|' "$RUNNER_TEMP/modules.txt")
+          lake exe cache get $files
+          du -sh .lake; df -h /
+      - name: Build lean4export
+        run: |
+          git clone -q https://github.com/leanprover/lean4export "$RUNNER_TEMP/lean4export"
+          cd "$RUNNER_TEMP/lean4export"
+          git checkout -q "$LEAN4EXPORT_REV"
+          cp "$RUNNER_TEMP/mathlib/lean-toolchain" lean-toolchain
+          lake build lean4export
+          cp .lake/build/bin/lean4export "$RUNNER_TEMP/tools/"
+          chmod +x "$RUNNER_TEMP"/tools/*
+          (cd "$RUNNER_TEMP/mathlib" && lake env which lean leanchecker)
+      - name: Measure
+        timeout-minutes: 320
+        run: |
+          python3 -u benchmarks/mathlib-sample/run_shard.py --mathlib "$RUNNER_TEMP/mathlib" \
+            --tools "$RUNNER_TEMP/tools" --out results --budget-min 290 $(cat "$RUNNER_TEMP/modules.txt")
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.shard }}
+          path: results/*.json
+          if-no-files-found: warn
+
+  aggregate:
+    needs: [shard]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: all
+      - name: Aggregate
+        env:
+          META: >-
+            {"mathlib": "${{ env.MATHLIB_REV }}", "lean": "v4.36.0", "seed": "${{ inputs.seed || '12' }}",
+            "sample_size": "${{ inputs.sample_size || '50' }}", "runner": "ubuntu-latest, 4 vCPU, 16 GB",
+            "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}
+        run: |
+          mkdir -p out
+          python3 benchmarks/mathlib-sample/aggregate.py all --md out/results.md --json out/results.json --meta "$META"
+          cat out/results.md >> "$GITHUB_STEP_SUMMARY"
+          cp -r all out/records
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mathlib-sample-results
+          path: out/

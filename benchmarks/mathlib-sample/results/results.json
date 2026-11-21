@@ -1,0 +1,233 @@
+{
+ "meta": {
+  "mathlib": "fc4f59e577feb1a4956671bc04ac18aaaf8cd842",
+  "lean": "v4.36.0",
+  "seed": "12",
+  "sample_size": "50",
+  "runner": "ubuntu-latest, 4 vCPU, 16 GB",
+  "run": "https://github.com/gimbalzero/certus/actions/runs/44948153611"
+ },
+ "modules_sampled": 50,
+ "modules_elaborated": 50,
+ "profiled_total_s": 173.98525921,
+ "group_totals_s": {
+  "kernel": 8.312380000000001,
+  "typeclass": 42.596474,
+  "linting": 4.9242300000000006,
+  "waiting": 18.55311,
+  "tactics": 25.78760641,
+  "interpretation": 21.8918,
+  "imports": 26.852700000000002,
+  "compilation": 2.4228217,
+  "elaboration": 22.6441371
+ },
+ "shares": {
+  "kernel": {
+   "n": 50,
+   "point": 0.04777634632809305,
+   "lo": 0.03590688007010343,
+   "hi": 0.061478125079179324
+  },
+  "typeclass": {
+   "n": 50,
+   "point": 0.24482806298311804,
+   "lo": 0.1180571257990316,
+   "hi": 0.3427198693137096
+  },
+  "linting": {
+   "n": 50,
+   "point": 0.028302570127831696,
+   "lo": 0.02416736889113742,
+   "hi": 0.035186864962073
+  },
+  "waiting": {
+   "n": 50,
+   "point": 0.1066361028758558,
+   "lo": 0.05764032546795079,
+   "hi": 0.1760682093546005
+  },
+  "tactics": {
+   "n": 50,
+   "point": 0.1482171910832652,
+   "lo": 0.11000874503786295,
+   "hi": 0.19617095620320335
+  },
+  "interpretation": {
+   "n": 50,
+   "point": 0.1258256021194107,
+   "lo": 0.10775286277940148,
+   "hi": 0.1566662298062418
+  },
+  "imports": {
+   "n": 50,
+   "point": 0.15433893722909492,
+   "lo": 0.10205472357771522,
+   "hi": 0.24728571609873914
+  },
+  "compilation": {
+   "n": 50,
+   "point": 0.013925442367940246,
+   "lo": 0.009371300085512025,
+   "hi": 0.021006545102812545
+  },
+  "elaboration": {
+   "n": 50,
+   "point": 0.13014974488539027,
+   "lo": 0.08380507839908591,
+   "hi": 0.16501885626520585
+  }
+ },
+ "kernel_share_of_profile": {
+  "n": 50,
+  "point": 0.04777634632809305,
+  "lo": 0.03590688007010343,
+  "hi": 0.061478125079179324
+ },
+ "kernel_share_excl_imports": {
+  "n": 50,
+  "point": 0.05649585682891487,
+  "lo": 0.042952655698883166,
+  "hi": 0.0752605648916026
+ },
+ "kernel_share_of_cpu": {
+  "n": 50,
+  "point": 0.05262765357999836,
+  "lo": 0.040241648721145495,
+  "hi": 0.0681414737370658
+ },
+ "search_share": {
+  "n": 50,
+  "point": 0.518870856185794,
+  "lo": 0.41817232741757737,
+  "hi": 0.5825013838402731
+ },
+ "elab_wall_s": 106.64699999999999,
+ "elab_cpu_s": 157.947,
+ "replay_n": 50,
+ "replay_only_vs_elab_wall": {
+  "n": 50,
+  "point": 0.057403452511556825,
+  "lo": 0.041800008054042624,
+  "hi": 0.07593500981994479
+ },
+ "replay_with_imports_vs_elab_wall": {
+  "n": 50,
+  "point": 0.7081602951794238,
+  "lo": 0.48841362835837676,
+  "hi": 1.0594744593077927
+ },
+ "replay_only_vs_profiled_kernel": {
+  "n": 50,
+  "point": 0.7364805266361739,
+  "lo": 0.6814525795456616,
+  "hi": 0.7960033886114556
+ },
+ "nanoda": {
+  "n": 49,
+  "attempted": 49,
+  "wall_s": 82.855,
+  "cpu_s": 243.36599999999999,
+  "elab_wall_s_same_modules": 106.194,
+  "vs_elab_wall": {
+   "n": 49,
+   "point": 0.7802229881160895,
+   "lo": 0.4313431447769176,
+   "hi": 1.3431443475612077
+  },
+  "median_wall_s": 0.703,
+  "max_rss_mb": 341.6
+ },
+ "leanchecker_closure": {
+  "n": 49,
+  "attempted": 49,
+  "wall_s": 367.412,
+  "cpu_s": 366.20799999999997,
+  "elab_wall_s_same_modules": 106.194,
+  "vs_elab_wall": {
+   "n": 49,
+   "point": 3.459818822155677,
+   "lo": 1.8563033580917105,
+   "hi": 6.074381395852509
+  },
+  "median_wall_s": 3.157,
+  "max_rss_mb": 554.5
+ },
+ "closure_decls": {
+  "n": 49,
+  "median": 4942,
+  "max": 45959,
+  "export_mb_median": 22.556049
+ },
+ "certus": {
+  "attempted": 49,
+  "accepted": 3,
+  "rejected": 46,
+  "other_failure": 0,
+  "rejections": {
+   "Lean.Syntax: nested inductive types are not supported yet": [
+    "Mathlib.Algebra.Algebra.Spectrum.Pi",
+    "Mathlib.Algebra.Category.ModuleCat.Monoidal.Symmetric",
+    "Mathlib.Algebra.Divisibility.Hom",
+    "Mathlib.Algebra.Group.Subsemigroup.Membership",
+    "Mathlib.Algebra.Module.Opposite",
+    "Mathlib.Algebra.Order.Archimedean.Defs",
+    "Mathlib.Algebra.Order.Floor.Defs",
+    "Mathlib.Algebra.Polynomial.Mirror",
+    "Mathlib.Algebra.SkewMonoidAlgebra.Lift",
+    "Mathlib.Algebra.Star.NonUnitalSubalgebra",
+    "Mathlib.AlgebraicGeometry.EllipticCurve.Projective.Formula",
+    "Mathlib.AlgebraicGeometry.Morphisms.SurjectiveOnStalks",
+    "Mathlib.Analysis.Calculus.Deriv.Polynomial",
+    "Mathlib.Analysis.Normed.Algebra.DualNumber",
+    "Mathlib.Analysis.Normed.Operator.Fredholm.Open",
+    "Mathlib.Analysis.Polynomial.Fourier",
+    "Mathlib.CategoryTheory.Adjunction.Opposites",
+    "Mathlib.CategoryTheory.Bicategory.Free",
+    "Mathlib.CategoryTheory.Enriched.FunctorCategory",
+    "Mathlib.CategoryTheory.Limits.Shapes.StrongEpi",
+    "Mathlib.CategoryTheory.Monoidal.Cartesian.Normal",
+    "Mathlib.CategoryTheory.Preadditive.Projective.Resolution",
+    "Mathlib.CategoryTheory.Subobject.FactorThru",
+    "Mathlib.Combinatorics.Additive.PluenneckeRuzsa",
+    "Mathlib.Data.Nat.Factorization.Induction",
+    "Mathlib.GroupTheory.Torsion",
+    "Mathlib.LinearAlgebra.TensorProduct.Opposite",
+    "Mathlib.MeasureTheory.Integral.Gamma",
+    "Mathlib.NumberTheory.Height.Northcott",
+    "Mathlib.NumberTheory.NumberField.FiniteAdeleRing",
+    "Mathlib.Order.Category.Preord",
+    "Mathlib.Order.Extension.Linear",
+    "Mathlib.Probability.Decision.Risk.Defs",
+    "Mathlib.Probability.Kernel.Defs",
+    "Mathlib.RingTheory.Etale.StandardEtale",
+    "Mathlib.RingTheory.GradedAlgebra.Homogeneous.Subsemiring",
+    "Mathlib.RingTheory.HahnSeries.Cardinal",
+    "Mathlib.RingTheory.Polynomial.Cyclotomic.Eval",
+    "Mathlib.RingTheory.PowerSeries.WellKnown",
+    "Mathlib.Tactic.Hessenberg.Reduce",
+    "Mathlib.Tactic.Linter.TextBased",
+    "Mathlib.Tactic.NormNum.DivMod",
+    "Mathlib.Topology.DerivedSet",
+    "Mathlib.Topology.Hom.Open",
+    "Mathlib.Topology.MetricSpace.CantorScheme",
+    "Mathlib.Util.DischargerAsTactic"
+   ]
+  },
+  "accepted_wall_s": 0.153,
+  "accepted_modules": [
+   "Mathlib.Data.QPF.Multivariate.Constructions.Comp",
+   "Mathlib.Logic.Function.Conjugate",
+   "Mathlib.Tactic.SudoSetOption"
+  ],
+  "closures_with_nested_inductives": 46,
+  "closures_scanned": 49
+ },
+ "failures": {},
+ "skipped_closure": {},
+ "verdict": {
+  "E1": "passes",
+  "H1_kernel_le_10pct": "holds (whole 95% interval at or below 10%)",
+  "E2_kernel_replay_only": "passes",
+  "E2_replay_with_per_module_imports": "fails"
+ }
+}
