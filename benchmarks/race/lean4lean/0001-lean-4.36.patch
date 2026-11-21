@@ -36,3 +36,19 @@ index afc942b..4a203e0 100644
        (moduleName2Idx := moduleName2Idx)
        (importAllModules := #[])
        (moduleData := moduleData))
+diff --git a/Lean4Lean/TypeChecker.lean b/Lean4Lean/TypeChecker.lean
+index 748a797..3ddd9b1 100644
+--- a/Lean4Lean/TypeChecker.lean
++++ b/Lean4Lean/TypeChecker.lean
+@@ -452,9 +452,9 @@ def unfoldDefinition (e : Expr) : RecM (Option Expr) := do
+ 
+ def reduceNative (_env : Environment) (e : Expr) : Except Exception (Option Expr) := do
+   let .app f (.const c _) := e | return none
+-  if f == .const ``reduceBool [] then
++  if f == .const `Lean.reduceBool [] then
+     throw <| .other s!"lean4lean does not support 'reduceBool {c}' reduction"
+-  else if f == .const ``reduceNat [] then
++  else if f == .const `Lean.reduceNat [] then
+     throw <| .other s!"lean4lean does not support 'reduceNat {c}' reduction"
+   return none
+ 
