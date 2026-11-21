@@ -15,14 +15,81 @@ use num_traits::{One, ToPrimitive, Zero};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
-pub type R<T> = Result<T, String>;
+pub type R<T> = Result<T, KError>;
+
+/// Why checking stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KError {
+    /// The input is not a valid proof: it is ill-typed or malformed.
+    Invalid(String),
+    /// Checking ran out of a resource (work budget or stack) before reaching a
+    /// verdict. Nothing is accepted, but nothing is shown to be wrong either.
+    Resource(String),
+}
+
+impl KError {
+    pub fn msg(&self) -> &str {
+        match self {
+            KError::Invalid(m) | KError::Resource(m) => m,
+        }
+    }
+
+    pub fn is_resource(&self) -> bool {
+        matches!(self, KError::Resource(_))
+    }
+}
+
+impl std::fmt::Display for KError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.msg())
+    }
+}
+
+impl From<&str> for KError {
+    fn from(m: &str) -> Self {
+        KError::Invalid(m.to_string())
+    }
+}
+
+impl From<String> for KError {
+    fn from(m: String) -> Self {
+        KError::Invalid(m)
+    }
+}
 
 /// Default work budget per declaration. Exceeding it is an error, so a
 /// hostile proof can make Certus give up, but never make it accept.
 pub const DEFAULT_FUEL: u64 = 200_000_000;
 
-/// Maximum nesting of definitional-equality checks (guards the stack).
-pub const MAX_DEPTH: u32 = 4_000;
+/// Stack size of the thread that `check` runs the kernel on. Only the pages
+/// actually used are committed, so this is an upper bound, not a cost.
+pub const STACK_SIZE: usize = 1 << 30;
+
+/// Stack kept free below the guard for recursion that does not pass through a
+/// guarded function (term traversals in `Store`, level normalisation).
+const STACK_RESERVE: usize = 64 << 20;
+
+/// Stack budget assumed when `TC` runs on a thread whose stack base was not
+/// recorded by `set_stack_base` (any thread has at least this much).
+const UNKNOWN_STACK_BUDGET: usize = 512 << 10;
+
+thread_local! {
+    /// Lowest stack address the kernel may recurse to on this thread (0: unset).
+    static STACK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The current stack position (stacks grow downwards on every supported target).
+#[inline(always)]
+fn stack_pos() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
+
+/// Record that the current thread was started with `STACK_SIZE` bytes of stack.
+pub(crate) fn set_stack_base() {
+    let limit = stack_pos().saturating_sub(STACK_SIZE - STACK_RESERVE);
+    STACK_LIMIT.with(|l| l.set(limit));
+}
 
 pub struct TC<'a> {
     pub st: &'a mut Store,
@@ -37,7 +104,8 @@ pub struct TC<'a> {
     check_cache: FxHashMap<E, E>,
     whnf_core_cache: FxHashMap<E, E>,
     whnf_cache: FxHashMap<E, E>,
-    depth: u32,
+    /// Recursion past this stack address is refused as a resource error.
+    stack_limit: usize,
     eq_cache: FxHashSet<(E, E)>,
     neq_cache: FxHashSet<(E, E)>,
     fuel: u64,
@@ -55,7 +123,10 @@ impl<'a> TC<'a> {
             check_cache: FxHashMap::default(),
             whnf_core_cache: FxHashMap::default(),
             whnf_cache: FxHashMap::default(),
-            depth: 0,
+            stack_limit: match STACK_LIMIT.with(|l| l.get()) {
+                0 => stack_pos().saturating_sub(UNKNOWN_STACK_BUDGET),
+                l => l,
+            },
             eq_cache: FxHashSet::default(),
             neq_cache: FxHashSet::default(),
             fuel: DEFAULT_FUEL,
@@ -66,9 +137,19 @@ impl<'a> TC<'a> {
         self.local.get(&n).cloned().or_else(|| self.env.get(n))
     }
 
+    /// One unit of work. Every recursive step of inference, reduction and
+    /// definitional equality goes through here, so this also guards the stack:
+    /// recursion that gets too deep is a resource error, never an overflow.
     fn burn(&mut self) -> R<()> {
+        if stack_pos() < self.stack_limit {
+            return Err(KError::Resource(
+                "out of stack (term or definitional-equality check nested too deeply)".into(),
+            ));
+        }
         if self.fuel == 0 {
-            return Err("work budget exhausted (proof too expensive to check, or non-terminating)".into());
+            return Err(KError::Resource(
+                "work budget exhausted (proof too expensive to check, or non-terminating)".into(),
+            ));
         }
         self.fuel -= 1;
         Ok(())
@@ -187,7 +268,7 @@ impl<'a> TC<'a> {
         let mut ps = Vec::new();
         self.st.level_params(l, &mut ps);
         match ps.iter().find(|p| !self.lparams.contains(p)) {
-            Some(p) => Err(format!("undeclared universe parameter (name id {p})")),
+            Some(p) => Err(format!("undeclared universe parameter (name id {p})").into()),
             None => Ok(()),
         }
     }
@@ -735,13 +816,7 @@ impl<'a> TC<'a> {
         if self.neq_cache.contains(&key) {
             return Ok(false);
         }
-        if self.depth > MAX_DEPTH {
-            return Err("definitional-equality check nested too deeply".into());
-        }
-        self.depth += 1;
-        let r = self.is_def_eq_core(a, b);
-        self.depth -= 1;
-        let r = r?;
+        let r = self.is_def_eq_core(a, b)?;
         if r {
             self.eq_cache.insert(key);
         } else {
@@ -997,5 +1072,61 @@ pub fn level_param(st: &Store, l: L) -> Option<NameId> {
     match st.lnode(l) {
         Level::Param(p) => Some(p),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `s (s (… (s x)))` with `n` applications.
+    fn tower(tc: &mut TC, s: E, x: E, n: usize) -> E {
+        (0..n).fold(x, |e, _| tc.st.app(s, e))
+    }
+
+    fn deep_def_eq(n: usize) -> R<bool> {
+        let mut st = Store::new();
+        let env = KEnv::default();
+        let mut tc = TC::new(&mut st, &env, Vec::new());
+        let prop = tc.st.sort(tc.st.zero);
+        let p_to_p = tc.st.mk(Node::Pi(prop, prop));
+        let s = tc.fresh_fvar(p_to_p, None);
+        let x = tc.fresh_fvar(prop, None);
+        let y = tc.fresh_fvar(prop, None);
+        let a = tower(&mut tc, s, x, n);
+        let b = tower(&mut tc, s, y, n);
+        tc.is_def_eq(a, b)
+    }
+
+    #[test]
+    fn deep_def_eq_is_a_resource_error_not_an_overflow() {
+        // Off the `check` thread, `TC` assumes a small stack budget, so a deep
+        // enough comparison must stop with a resource error, not overflow.
+        let r =
+            std::thread::Builder::new().stack_size(16 << 20).spawn(|| deep_def_eq(100_000)).unwrap().join().unwrap();
+        match r {
+            Err(e) => assert!(e.is_resource(), "expected a resource error, got: {e}"),
+            Ok(v) => panic!("expected a resource error, got a verdict: {v}"),
+        }
+    }
+
+    #[test]
+    fn deep_def_eq_decides_on_the_checker_stack() {
+        // The stack `check` runs on is deep enough for a long comparison.
+        let r = std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(|| {
+                set_stack_base();
+                deep_def_eq(100_000)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(r, Ok(false));
+    }
+
+    #[test]
+    fn shallow_def_eq_still_decides() {
+        assert_eq!(deep_def_eq(100), Ok(false));
     }
 }

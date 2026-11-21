@@ -4,7 +4,7 @@
 //! standard equality type (since `Quot.lift` mentions it).
 
 use crate::env::{Kind, QuotKind};
-use crate::tc::{R, TC};
+use crate::tc::{KError, R, TC};
 use crate::term::{E, Level};
 use certus_core::export::NameId;
 
@@ -83,7 +83,7 @@ pub fn check_quot(tc: &mut TC, kind: QuotKind, lparams: &[NameId], ty: E) -> R<(
 /// `Eq.{u} : {α : Sort u} → α → α → Prop` with the single constructor
 /// `Eq.refl.{u} : ∀ {α : Sort u} (a : α), Eq a a`.
 fn check_eq(tc: &mut TC, eq: NameId, eq_refl: NameId) -> R<()> {
-    let bad = || "Eq is not the standard equality type".to_string();
+    let bad = || KError::from("Eq is not the standard equality type");
     let e = tc.get_const(eq).ok_or("quotients need Eq to be declared first")?;
     let Kind::Induct { num_params: 2, num_indices: 1, ctors, .. } = &e.kind else { return Err(bad()) };
     if ctors.as_slice() != [eq_refl] || e.lparams.len() != 1 {
