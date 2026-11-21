@@ -10,7 +10,7 @@
 //! the same text map to one id. That way, dependency analysis can never miss
 //! an edge because the exporter happened to emit a name twice.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::BufRead;
@@ -35,7 +35,7 @@ pub enum Level {
     Param(NameId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BinderInfo {
     Default,
@@ -60,7 +60,7 @@ pub enum Expr {
 
 // ---- Declarations: stored exactly as exported (ids rewritten to canonical names). ----
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AxiomVal {
     pub name: NameId,
@@ -69,7 +69,7 @@ pub struct AxiomVal {
     pub is_unsafe: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefVal {
     pub name: NameId,
@@ -83,7 +83,7 @@ pub struct DefVal {
     pub all: Vec<NameId>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThmVal {
     pub name: NameId,
@@ -93,7 +93,7 @@ pub struct ThmVal {
     pub all: Vec<NameId>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpaqueVal {
     pub name: NameId,
@@ -104,7 +104,7 @@ pub struct OpaqueVal {
     pub all: Vec<NameId>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QuotVal {
     pub name: NameId,
@@ -113,7 +113,7 @@ pub struct QuotVal {
     pub kind: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InductiveType {
     pub name: NameId,
@@ -129,7 +129,7 @@ pub struct InductiveType {
     pub is_reflexive: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CtorVal {
     pub name: NameId,
@@ -142,7 +142,7 @@ pub struct CtorVal {
     pub is_unsafe: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecRule {
     pub ctor: NameId,
@@ -150,7 +150,7 @@ pub struct RecRule {
     pub rhs: ExprId,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecVal {
     pub name: NameId,
@@ -168,7 +168,7 @@ pub struct RecVal {
 
 /// A mutual block of inductive types with their constructors and recursors.
 /// The kernel checks a block as one unit, so Certus treats it as one declaration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InductiveVal {
     pub types: Vec<InductiveType>,
@@ -244,6 +244,40 @@ impl Decl {
         }
     }
 
+    /// Apply `f` to every expression id stored in the declaration.
+    pub fn map_exprs(&mut self, f: &mut impl FnMut(ExprId) -> ExprId) {
+        match self {
+            Decl::Axiom(d) => d.r#type = f(d.r#type),
+            Decl::Quot(d) => d.r#type = f(d.r#type),
+            Decl::Def(d) => {
+                d.r#type = f(d.r#type);
+                d.value = f(d.value);
+            }
+            Decl::Thm(d) => {
+                d.r#type = f(d.r#type);
+                d.value = f(d.value);
+            }
+            Decl::Opaque(d) => {
+                d.r#type = f(d.r#type);
+                d.value = f(d.value);
+            }
+            Decl::Inductive(d) => {
+                for t in &mut d.types {
+                    t.r#type = f(t.r#type);
+                }
+                for c in &mut d.ctors {
+                    c.r#type = f(c.r#type);
+                }
+                for r in &mut d.recs {
+                    r.r#type = f(r.r#type);
+                    for rule in &mut r.rules {
+                        rule.rhs = f(rule.rhs);
+                    }
+                }
+            }
+        }
+    }
+
     /// True for anything outside Lean's safe fragment.
     pub fn is_unsafe_or_partial(&self) -> bool {
         match self {
@@ -260,7 +294,7 @@ impl Decl {
     }
 
     /// Apply `f` to every name id stored in the declaration.
-    fn map_names(&mut self, f: &mut impl FnMut(NameId) -> Result<NameId, String>) -> Result<(), String> {
+    pub fn map_names(&mut self, f: &mut impl FnMut(NameId) -> Result<NameId, String>) -> Result<(), String> {
         fn all(v: &mut [NameId], f: &mut impl FnMut(NameId) -> Result<NameId, String>) -> Result<(), String> {
             for x in v {
                 *x = f(*x)?;
@@ -322,7 +356,7 @@ impl Decl {
 
 // ---- Header ----
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Meta {
     pub exporter: Tool,
@@ -330,20 +364,20 @@ pub struct Meta {
     pub lean: LeanInfo,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tool {
     pub name: String,
     pub version: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Format {
     pub version: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeanInfo {
     pub githash: String,

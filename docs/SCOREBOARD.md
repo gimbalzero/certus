@@ -8,12 +8,12 @@ Status key: ⬜ not started · 🟨 started · 🟩 measured win · ➖ out of s
 
 | # | Axis | Measure | Best today | Lean 4 | Certus target | Status |
 |---|---|---|---|---|---|---|
-| 1 | Fresh full check | Source to "verified" | Metamath: all of set.mm (48k theorems) in **6.9–10.1 s**, 1 core ([measured](../benchmarks/proof-bench)) | RH proof ≈ 20 h on 256 cores | Minutes on a laptop, from certificates | ⬜ |
-| 2 | Kernel check speed | Steps or declarations per second per core | Metamath Zero | nanoda: core library (58,555 decls) in **63 CPU-s** ([measured](../benchmarks/proof-bench)) | ≥ 1M steps/s/core (H2) | ⬜ Phase 1 |
+| 1 | Fresh full check | Source to "verified" | Metamath: all of set.mm (48k theorems) in **6.9–10.1 s**, 1 core ([measured](../benchmarks/proof-bench)) | RH proof ≈ 20 h on 256 cores | Minutes on a laptop, from certificates | 🟩 1,000 theorems + foundations: 0.38 s vs Lean's 5.7 s build ([race](../benchmarks/race)) |
+| 2 | Kernel check speed | Steps or declarations per second per core | Metamath Zero | nanoda: core library (58,555 decls) in **63 CPU-s** ([measured](../benchmarks/proof-bench)) | ≥ 1M steps/s/core (H2) | 🟨 Certus kernel: 3,080 decls in 0.38 CPU-s, the least CPU of the checkers raced ([race](../benchmarks/race)) |
 | 3 | Rebuild after one edit | Seconds | Isabelle, Lean | Re-elaborates everything downstream | < 1 s | ⬜ Phase 3 |
 | 4 | Re-check unchanged project | Seconds | Nobody | **18 s** wall re-checking the core library every run ([measured](../benchmarks/proof-bench)) | < 1 s (content-hash cache) | 🟨 hashing done: 6.5M nodes in 1.3 s |
 | 5 | Editor responsiveness | ms per edit | Isabelle | Good on small files, poor on large | < 50 ms | ➖ Phase 4 |
-| 6 | Parallel scaling | Speedup with cores | Nobody well | Limited by files and chains | Near-linear (per-declaration) | ⬜ Phase 1 |
+| 6 | Parallel scaling | Speedup with cores | Nobody well | Limited by files and chains | Near-linear (per-declaration) | ⬜ next milestone |
 | 7 | Memory | Peak RAM | Metamath | High | 10× below Lean | 🟨 whole core library in 0.5 GB |
 | 8 | Proof and cache size | Bytes | Metamath (50 MB text for set.mm) | Automated proofs 7× bigger than explicit ([measured](../benchmarks/proof-bench)) | Smaller than Lean's oleans | ⬜ |
 | 9 | Startup and imports | Time to first line | Metamath | 0.8–1.0 s for core Lean ([measured](../benchmarks/proof-bench)) | < 50 ms | ⬜ Phase 3 |
@@ -23,9 +23,9 @@ Status key: ⬜ not started · 🟨 started · 🟩 measured win · ➖ out of s
 
 | # | Axis | Measure | Best today | Lean 4 | Certus target | Status |
 |---|---|---|---|---|---|---|
-| 11 | Trusted code size | Lines that must be right | Metamath Zero (~730 lines of C) | ~8–20k lines of C++ (est.) | < 5k lines of Rust | ⬜ Phase 2 |
+| 11 | Trusted code size | Lines that must be right | Metamath Zero (~730 lines of C) | ~8–20k lines of C++ (est.) | < 5k lines of Rust | 🟨 ~2,800 lines today (not yet complete: no nested inductives) |
 | 12 | Verified kernel | Formal proof of the checker | Candle (to machine code) | Lean4Lean, partial | Aeneas or Verus proof | ⬜ Phase 2 |
-| 13 | Independent checkers | Separately written checkers that agree | **Lean** (nanoda, Lean4Lean, con-leche, …) | Strong | 3+ by default | ⬜ |
+| 13 | Independent checkers | Separately written checkers that agree | **Lean** (nanoda, Lean4Lean, con-leche, …) | Strong | 3+ by default | 🟨 Certus is a new independent checker; agrees with nanoda and con-leche on all race certificates |
 | 14 | Soundness record and response | Bugs/year, disclosure process | HOL Light | Kernel bugs exploited in 2026 | Fixed disclosure timeline | 🟨 [SECURITY.md](../SECURITY.md) |
 | 15 | Consistency of foundations | Proven consistent? | HOL family | Studied, not fully proven | Proven within a stronger system | ➖ |
 | 16 | Escape-hatch control | Every unchecked shortcut detected | Metamath (none exist) | `#print axioms`, comparator | Automatic, for every theorem | 🟨 `certus deps` lists axioms and flags `sorryAx`, unsafe and partial; matches `#print axioms` |

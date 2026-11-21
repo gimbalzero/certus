@@ -1,4 +1,5 @@
 /target
 .DS_Store
-# Lean exports are large; generate them locally.
+# Lean exports are large; generate them locally. Small test fixtures are kept.
 *.ndjson
+!crates/*/tests/fixtures/*.ndjson

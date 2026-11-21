@@ -8,12 +8,26 @@ Certus separates the two. **Search once, check forever.** The author's machine p
 
 The goal: **minutes on a laptop instead of days on a server**, and the best system on every one of the [44 axes](docs/SCOREBOARD.md) we track.
 
-> **Status: Phase 0.** Certus can read Lean kernel exports, hash them and analyse them. It does **not** type-check proofs yet; that is Phase 1. See the [plan](docs/PLAN.md).
+> **Status: early Phase 1.** Certus has a working kernel: it type-checks Lean proofs from scratch, regenerates every recursor rather than trusting it, and beats Lean by 15–30× on our first benchmark. Nested inductive types and multi-core checking are next. See the [plan](docs/PLAN.md).
+
+## The race
+
+The same theorem, 2·(0+1+…+n) = n(n+1), checked from a certificate containing it and everything it depends on, back to the definition of `Nat` ([full results](benchmarks/race)):
+
+| | 1 theorem | 1,000 theorems |
+|---|---|---|
+| **Certus** (1 core) | **10 ms** | **384 ms** (least CPU of all) |
+| nanoda (8 cores) | 8 ms | 125 ms |
+| con-leche (8 cores) | 17 ms | 391 ms |
+| Lean kernel replay (trusts imports) | 390 ms | 1,210 ms |
+| Lean, build from source | 297 ms | 5,650 ms |
 
 ## What works today
 
 ```bash
 cargo build --release
+./target/release/certus check export.ndjson My.theorem             # type-check it and everything it uses
+./target/release/certus extract export.ndjson cert.ndjson My.theorem   # write a minimal certificate
 ./target/release/certus stats export.ndjson          # counts, throughput, repeated content
 ./target/release/certus hash  export.ndjson --manifest decls.tsv   # content hash of every declaration
 ./target/release/certus deps  export.ndjson My.theorem             # what it depends on, and its axioms
@@ -21,6 +35,7 @@ cargo build --release
 
 Exports come from [`lean4export`](https://github.com/leanprover/lean4export) (format 3.x).
 
+- **A real kernel** (~2,800 lines of Rust). It checks types, definitions, theorems, inductive types (positivity, universes, and recursors rebuilt from scratch), and quotients. It also has proof irrelevance, eta and fast `Nat` arithmetic, which switches on only after it verifies `Nat` and each operation are the genuine ones. It rejects every tampered certificate in its test suite.
 - **Strict reader.** It rejects unknown fields and record kinds, forward references, gaps in ids, duplicate declarations and malformed literals.
 - **Content hashes.** Every name, level, expression and declaration gets a BLAKE3 hash, as defined in the [certificate spec v0](docs/spec/certificate-v0.md). This is the basis for a cache that never needs trusting.
 - **Dependency closure and axiom audit.** It lists exactly which declarations and axioms a theorem rests on, and flags `sorryAx`, unsafe and partial definitions. Verified to match Lean's `#print axioms` on our benchmark.
@@ -43,8 +58,8 @@ From the [Lean vs Metamath benchmark](benchmarks/proof-bench), about **92%** of 
 
 | Phase | Goal |
 |---|---|
-| **0. Foundation** (now) | Spec, tools, baselines; measure Mathlib's search-vs-check split |
-| **1. Fastest checker** | Parallel Rust kernel with a content-addressed cache; beat nanoda on Lean's core library |
+| **0. Foundation** (done) | Spec, tools, baselines; measure Mathlib's search-vs-check split |
+| **1. Fastest checker** (now) | Parallel Rust kernel with a content-addressed cache; beat nanoda on Lean's core library |
 | **2. Most trusted** | Kernel under 5,000 lines, formal verification, full statement audit |
 | **3. Best build experience** | Lake plugin, sub-second rebuilds, verification in the browser |
 | **4–5.** | AI-first proof writing, permanent certificates, zero-knowledge verification |

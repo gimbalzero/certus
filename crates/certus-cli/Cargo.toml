@@ -13,3 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 certus-core = { path = "../certus-core" }
+certus-kernel = { path = "../certus-kernel" }

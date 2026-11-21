@@ -21,6 +21,13 @@ USAGE:
         Everything <Decl.Name> depends on, and the axioms it rests on.
         With --list, print every declaration in the closure.
 
+    certus check <export.ndjson> [<Decl.Name>...]
+        Type-check declarations with the Certus kernel. With names, check
+        exactly what those declarations depend on; without, check everything.
+    certus extract <export.ndjson> <out.ndjson> <Decl.Name>...
+        Write a minimal certificate: the named declarations plus everything
+        they depend on, as a standalone export file.
+
 Exports come from lean4export (format 3.x).";
 
 /// The axioms accepted by Mathlib and by Lean's own checkers.
@@ -34,6 +41,8 @@ fn main() -> ExitCode {
         Some("hash") if args.len() == 4 && args[2] == "--manifest" => hash_cmd(&args[1], Some(&args[3])),
         Some("deps") if args.len() == 3 => deps_cmd(&args[1], &args[2], false),
         Some("deps") if args.len() == 4 && args[3] == "--list" => deps_cmd(&args[1], &args[2], true),
+        Some("check") if args.len() >= 2 => with_big_stack(move || check_cmd(&args[1], &args[2..])),
+        Some("extract") if args.len() >= 4 => extract_cmd(&args[1], &args[2], &args[3..]),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
@@ -175,5 +184,53 @@ fn deps_cmd(path: &str, name: &str, list: bool) -> Result<(), String> {
             println!("{}\t{}", env.decls[i].kind(), env.name_str(env.decls[i].primary_name()));
         }
     }
+    Ok(())
+}
+
+/// Deeply nested proof terms need a deep stack.
+fn with_big_stack(f: impl FnOnce() -> Result<(), String> + Send + 'static) -> Result<(), String> {
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(f)
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "checker thread panicked".to_string())?
+}
+
+fn resolve(env: &Env, names: &[String]) -> Result<Vec<usize>, String> {
+    if names.len() <= 2 {
+        return names.iter().map(|n| env.find_decl(n).ok_or_else(|| format!("no declaration named {n}"))).collect();
+    }
+    let index: std::collections::HashMap<String, usize> =
+        env.decl_of_name.iter().map(|(&n, &i)| (env.name_str(n), i)).collect();
+    names.iter().map(|n| index.get(n).copied().ok_or_else(|| format!("no declaration named {n}"))).collect()
+}
+
+fn check_cmd(path: &str, names: &[String]) -> Result<(), String> {
+    let env = load(path)?;
+    let decls: Vec<usize> = if names.is_empty() {
+        (0..env.decls.len()).collect()
+    } else {
+        let roots = resolve(&env, names)?;
+        deps::closure(&env, &roots).decls
+    };
+    let r = certus_kernel::check(&env, &decls).map_err(|e| format!("REJECTED {e}"))?;
+    let kinds: Vec<String> = r.by_kind.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    println!("OK: {} declarations type-checked in {:.3} s ({})", r.checked, r.time.as_secs_f64(), kinds.join(", "));
+    println!("term nodes: {}; Nat operations verified for native arithmetic: {}", r.term_nodes, r.native_nat_ops);
+    for (n, t) in &r.slowest {
+        println!("  {:>9.3} ms  {n}", t.as_secs_f64() * 1e3);
+    }
+    Ok(())
+}
+
+fn extract_cmd(path: &str, out: &str, names: &[String]) -> Result<(), String> {
+    let env = load(path)?;
+    let roots = resolve(&env, names)?;
+    let c = deps::closure(&env, &roots);
+    let f = File::create(out).map_err(|e| format!("{out}: {e}"))?;
+    certus_core::write::write_subset(&env, &c.decls, BufWriter::new(f)).map_err(|e| format!("{out}: {e}"))?;
+    let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    println!("wrote {} declarations to {out} ({:.1} KB)", c.decls.len(), size as f64 / 1e3);
     Ok(())
 }

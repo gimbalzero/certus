@@ -17,7 +17,7 @@ The goal is to be the best proof-checking system on all 44 axes in [SCOREBOARD.m
 
 ## Phases
 
-### Phase 0: Foundation (now)
+### Phase 0: Foundation (done, except E1/E2)
 - [x] Public repo, Apache-2.0 licence, security policy, CI
 - [x] Certificate spec v0: content hashing ([spec](spec/certificate-v0.md))
 - [x] `certus` tool: strict export reader, content hashes, dependency closure, axiom audit
@@ -26,10 +26,15 @@ The goal is to be the best proof-checking system on all 44 axes in [SCOREBOARD.m
 - [ ] **E1 and E2 on Mathlib**, on a rented 32–64 core machine
 - **Done when** the scoreboard has measured baselines and E1/E2 have settled H1.
 
-### Phase 1: The fastest checker (months 1–4)
-- Parallel Rust type checker for the Lean kernel, building on nanoda's design
+### Phase 1: The fastest checker (now)
+- [x] Rust type checker for the Lean kernel: inference, reduction, definitional equality, inductive types with regenerated recursors, quotients, verified-only native `Nat` arithmetic
+- [x] `certus extract`: minimal certificates; race against Lean, nanoda, con-leche ([results](../benchmarks/race))
+- [x] Tamper suite: wrong proof, changed statement, missing dependency, forged recursor, data as theorem, injected field, partial definition
+- [ ] Nested inductive types (needed for `Lean.Syntax`, `Array`-based types, much of Mathlib)
+- [ ] Multi-core checking (Certus already uses the least CPU; parallelism should make it fastest on the clock)
+- [ ] Check all of Lean's core library, then the Lean Kernel Arena tests
 - Per-declaration cache keyed by content hash: unchanged declarations are never re-checked
-- Check only the dependency closure of the target
+- [x] Check only the dependency closure of the target
 - All of Mathlib exported as certificates
 - **Done when** it beats nanoda's 18 s on Lean's core library, re-checks any cached project in under 1 s, and agrees with Lean on all Lean Kernel Arena tests. Then post on the Lean Zulip.
 

@@ -7,3 +7,4 @@ lean/SumProf.lean
 metamath/src/
 metamath/metamath
 metamath/set.mm
+metamath/race_*.cmd
