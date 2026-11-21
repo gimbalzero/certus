@@ -41,6 +41,18 @@ Exports come from [`lean4export`](https://github.com/leanprover/lean4export) (fo
 - **Content hashes.** Every name, level, expression and declaration gets a BLAKE3 hash, as defined in the [certificate spec v0](docs/spec/certificate-v0.md). This is the basis for a cache that never needs trusting.
 - **Dependency closure and axiom audit.** It lists exactly which declarations and axioms a theorem rests on, and flags `sorryAx`, unsafe and partial definitions. Verified to match Lean's `#print axioms` on our benchmark.
 
+## Lean Kernel Arena
+
+CI runs the [Lean Kernel Arena](https://arena.lean-lang.org) test suite on every pull request ([workflow](.github/workflows/arena.yml)). These are the community's export files that a correct checker must accept or reject. The run fails on any new false acceptance. A false acceptance that is already tracked by a `soundness` issue is listed in [`known-unsound.txt`](tests/arena/known-unsound.txt) and is still reported in every run. False rejections are listed in the job summary, and each cause has its own issue. To run it locally:
+
+```bash
+cargo build --release
+python3 tests/arena/run.py                 # the pinned round 2026-09; downloads ~4 MB to ~/.cache/certus-arena
+python3 tests/arena/run.py --suite live    # the tests arena.lean-lang.org serves today
+```
+
+The large real-world corpora (Init, Std, Mathlib, …) are not in the Arena's download and are skipped. So are the `either` corner cases, which the Arena does not score.
+
 ## First results
 
 The 348 MB export of Lean 4.36's core library plus one test file, on an Apple M2 laptop, single-threaded:
