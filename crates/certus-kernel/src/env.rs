@@ -95,6 +95,7 @@ pub struct Builtins {
     pub quot_ind: Option<NameId>,
     pub opt_param: Option<NameId>,
     pub out_param: Option<NameId>,
+    pub semi_out_param: Option<NameId>,
     pub auto_param: Option<NameId>,
 }
 
@@ -158,6 +159,7 @@ impl Builtins {
             quot_ind: lookup("Quot.ind"),
             opt_param: lookup("optParam"),
             out_param: lookup("outParam"),
+            semi_out_param: lookup("semiOutParam"),
             auto_param: lookup("autoParam"),
         }
     }
