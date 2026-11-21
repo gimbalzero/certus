@@ -198,7 +198,9 @@ def measure(mod, a, env, deadline, scratch):
 
     r = run(["lean", "--run", os.path.join(HERE, "lean", "ModuleDecls.lean"), mod],
             a.mathlib, env, 900)
-    roots = r["_stdout"].split()
+    pairs = [ln.split("\t") for ln in r["_stdout"].splitlines() if "\t" in ln]
+    roots = [p[0] for p in pairs]
+    plain_roots = [p[1] for p in pairs]
     rec["roots"] = len(roots)
     if not r["ok"] or not roots:
         rec["roots_error"] = r["tail"] or "no declarations"
@@ -238,7 +240,7 @@ def measure(mod, a, env, deadline, scratch):
 
         cert = os.path.join(scratch, "closure.cert.ndjson")
         certus = os.path.join(a.tools, "certus")
-        r = run([certus, "extract", export, cert, *roots], scratch, env, a.export_timeout)
+        r = run([certus, "extract", export, cert, *plain_roots], scratch, env, a.export_timeout)
         m = re.search(r"wrote (\d+) declarations", r["_stdout"])
         r["decls"] = int(m.group(1)) if m else None
         if r["ok"]:

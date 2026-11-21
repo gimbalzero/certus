@@ -144,6 +144,10 @@ def main():
         "other_failure": sum(1 for r in cc if not r["certus_check"]["ok"] and not r["certus_check"].get("rejected")),
         "rejections": {k: v for k, v in sorted(reasons.items(), key=lambda kv: -len(kv[1]))},
         "accepted_wall_s": sum(r["certus_check"]["wall_s"] for r in cc if r["certus_check"]["ok"]),
+        "accepted_modules": [r["module"] for r in cc if r["certus_check"]["ok"]],
+        "closures_with_nested_inductives": sum(
+            1 for r in recs if r.get("certus_extract", {}).get("nested_inductive_blocks")),
+        "closures_scanned": sum(1 for r in recs if "nested_inductive_blocks" in r.get("certus_extract", {})),
     }
     res["failures"] = {
         r["module"]: {s: r[s].get("tail", "")[-300:] or ("timed out" if r[s].get("timed_out") else "failed")
@@ -162,9 +166,13 @@ def main():
         h1 = "fails (whole 95% interval above 10%)"
     else:
         h1 = "inconclusive (95% interval straddles 10%)"
-    e2r = res["replay_with_imports_vs_elab_wall"]
-    e2 = ("fails" if e2r["point"] > 0.30 else "passes") if e2r else "not measured"
-    res["verdict"] = {"E1": e1, "H1_kernel_le_10pct": h1, "E2": e2}
+    def e2v(r):
+        return ("fails" if r["point"] > 0.30 else "passes") if r else "not measured"
+
+    e2k = e2v(res["replay_only_vs_elab_wall"])
+    e2i = e2v(res["replay_with_imports_vs_elab_wall"])
+    res["verdict"] = {"E1": e1, "H1_kernel_le_10pct": h1, "E2_kernel_replay_only": e2k,
+                      "E2_replay_with_per_module_imports": e2i}
 
     with open(a.json, "w") as f:
         json.dump(res, f, indent=1)
@@ -204,10 +212,15 @@ def main():
              f"{c['rejected']} rejected as unsupported, {c['other_failure']} other failures (timeout or crash).\n")
     for reason, mods in c["rejections"].items():
         L.append(f"- {len(mods)}× `{reason}`")
+    if c["accepted_modules"]:
+        L.append(f"- Accepted: " + ", ".join(f"`{m}`" for m in c["accepted_modules"]))
+    L.append(f"- Closures containing at least one nested inductive: {c['closures_with_nested_inductives']} "
+             f"of {c['closures_scanned']}")
     L.append("\n## Verdict\n")
     L.append(f"- E1 (fails if kernel share > 50%): **{e1}**")
     L.append(f"- H1 (kernel ≤ 10%): **{h1}**")
-    L.append(f"- E2 (fails if replay > 30% of build; replay including imports vs elaboration wall): **{e2}**\n")
+    L.append(f"- E2 (fails if replay > 30% of build), kernel replay alone: **{e2k}**")
+    L.append(f"- E2, replay including each module's import loading (as `leanchecker` does it): **{e2i}**\n")
     if res["failures"] or res["skipped_closure"]:
         L.append("## Steps that did not finish\n")
         for m, v in res["failures"].items():

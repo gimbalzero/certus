@@ -1,6 +1,7 @@
 /-
-Print the declarations a module defines itself (not the ones it imports), one per line, in a form
-lean4export accepts after `--`. These are the roots of the module's dependency closure.
+Print the declarations a module defines itself (not the ones it imports), one per line. Each line
+is the name as lean4export parses it after `--` (with «» escapes), a tab, and the plain
+dot-joined form that `certus` uses. These are the roots of the module's dependency closure.
 
     lake env lean --run ModuleDecls.lean Mathlib.Logic.Basic
 -/
@@ -18,6 +19,9 @@ def main (args : List String) : IO UInt32 := do
     if env.getModuleIdxFor? n != some idx || n.isInternal then continue
     let s := toString n
     -- lean4export parses its arguments with `decodeNameLit`; only print names that round-trip.
-    if Syntax.decodeNameLit ("`" ++ s) == some n then IO.println s else skipped := skipped + 1
+    if Syntax.decodeNameLit ("`" ++ s) == some n then
+      IO.println s!"{s}\t{n.toString (escape := false)}"
+    else
+      skipped := skipped + 1
   if skipped > 0 then IO.eprintln s!"skipped {skipped} names that do not round-trip"
   return 0
