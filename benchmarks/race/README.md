@@ -36,7 +36,7 @@ Each copy has its own recursive definition, so this is 1,000 definitions and 1,0
 
 ## Not in the race (yet)
 
-- **The automated (`simp`/`omega`) proof.** It depends on `Lean.Syntax`, a *nested* inductive type, which Certus rejects for now rather than skipping. Nested inductives are the next kernel feature.
+- **The automated (`simp`/`omega`) proof.** It depends on `Lean.Syntax`, a *nested* inductive type. Certus now checks it (1,341 declarations, 4.2 MB certificate, about 190 ms; nanoda and con-leche accept the same certificate), but it has not been raced yet.
 - **Lean4Lean.** The binary we have was built for a different Lean version.
 - **Rocq, Isabelle, Agda, HOL Light.** Each needs several GB to install, which this machine doesn't have free. They are planned for CI.
 - **Metamath on just this theorem.** set.mm's `arisum` depends on 4,594 earlier theorems. Verifying them one command at a time took 44 s, almost all of it command overhead, so the number would mislead. The whole-library time above is the fair Metamath figure.

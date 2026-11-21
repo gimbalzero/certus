@@ -30,7 +30,7 @@ The goal is to be the best proof-checking system on all 44 axes in [SCOREBOARD.m
 - [x] Rust type checker for the Lean kernel: inference, reduction, definitional equality, inductive types with regenerated recursors, quotients, verified-only native `Nat` arithmetic
 - [x] `certus extract`: minimal certificates; race against Lean, nanoda, con-leche ([results](../benchmarks/race))
 - [x] Tamper suite: wrong proof, changed statement, missing dependency, forged recursor, data as theorem, injected field, partial definition
-- [ ] Nested inductive types (needed for `Lean.Syntax`, `Array`-based types, much of Mathlib)
+- [x] Nested inductive types (needed for `Lean.Syntax`, `Array`-based types, much of Mathlib)
 - [ ] Multi-core checking (Certus already uses the least CPU; parallelism should make it fastest on the clock)
 - [ ] Check all of Lean's core library, then the Lean Kernel Arena tests
 - Per-declaration cache keyed by content hash: unchanged declarations are never re-checked
