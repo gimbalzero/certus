@@ -173,10 +173,29 @@ def first_line(text: str, needle: str) -> str:
     return lines[-1].strip() if lines else ""
 
 
-def run_one(certus: Path, test: dict, timeout: float) -> dict:
+def limit_memory(gb: float):
+    """A preexec_fn capping the child's address space (enforced on Linux, not on macOS)."""
+    if gb <= 0 or not sys.platform.startswith("linux"):
+        return None
+    import resource
+
+    def apply() -> None:
+        n = int(gb * (1 << 30))
+        resource.setrlimit(resource.RLIMIT_AS, (n, n))
+
+    return apply
+
+
+def run_one(certus: Path, test: dict, timeout: float, memory_gb: float) -> dict:
     t0 = time.monotonic()
     try:
-        p = subprocess.run([str(certus), "check", str(test["path"])], capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(
+            [str(certus), "check", str(test["path"])],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            preexec_fn=limit_memory(memory_gb),
+        )
     except subprocess.TimeoutExpired:
         return {**test, "verdict": "timeout", "reason": f"no verdict after {timeout:.0f} s", "secs": timeout}
     secs = time.monotonic() - t0
@@ -185,6 +204,8 @@ def run_one(certus: Path, test: dict, timeout: float) -> dict:
         verdict, reason = "accept", first_line(p.stdout, "OK:")
     elif p.returncode == 1 and "panicked" not in out:
         verdict, reason = "reject", first_line(p.stderr, "error:").removeprefix("error: ")
+    elif "memory allocation" in out:
+        verdict, reason = "error", f"exceeded the {memory_gb:g} GB memory limit"
     else:
         verdict, reason = "error", f"exit {p.returncode}: {first_line(out, 'panicked')}"
     return {**test, "verdict": verdict, "reason": reason, "secs": secs}
@@ -208,6 +229,7 @@ def main() -> int:
     ap.add_argument("--refresh", action="store_true", help="re-download unpinned suites")
     ap.add_argument("--timeout", type=float, default=300.0, help="seconds per test (default: %(default)s)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1)
+    ap.add_argument("--memory-limit", type=float, default=4.0, help="GB of address space per test, Linux only; 0 for none (default: %(default)s)")
     ap.add_argument("-k", "--filter", default="", help="only run tests whose name contains this")
     ap.add_argument("--json", type=Path, help="write per-test results here")
     ap.add_argument("--summary", type=Path, help="append a Markdown summary here (e.g. $GITHUB_STEP_SUMMARY)")
@@ -222,7 +244,7 @@ def main() -> int:
     print(f"suite {args.suite}: {len(runnable)} tests to run, {len(skipped)} skipped", file=sys.stderr)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        results = list(pool.map(lambda t: run_one(args.certus, t, args.timeout), runnable))
+        results = list(pool.map(lambda t: run_one(args.certus, t, args.timeout, args.memory_limit), runnable))
     known = known_unsound()
     for r in results:
         r["class"] = classify(r, known)

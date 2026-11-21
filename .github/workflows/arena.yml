@@ -43,6 +43,8 @@ jobs:
           python3 -I tests/arena/run.py
           --suite ${{ matrix.suite }}
           --timeout 300
+          --jobs 3
+          --memory-limit 4
           --json arena-${{ matrix.suite }}.json
           --summary "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
