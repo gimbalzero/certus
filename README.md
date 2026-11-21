@@ -31,6 +31,7 @@ cargo build --release
 ./target/release/certus stats export.ndjson          # counts, throughput, repeated content
 ./target/release/certus hash  export.ndjson --manifest decls.tsv   # content hash of every declaration
 ./target/release/certus deps  export.ndjson My.theorem             # what it depends on, and its axioms
+./target/release/certus show  export.ndjson My.theorem [--raw]     # the exact statement that was proved
 ```
 
 Exports come from [`lean4export`](https://github.com/leanprover/lean4export) (format 3.x).

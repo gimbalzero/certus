@@ -29,7 +29,7 @@ Status key: ⬜ not started · 🟨 started · 🟩 measured win · ➖ out of s
 | 14 | Soundness record and response | Bugs/year, disclosure process | HOL Light | Kernel bugs exploited in 2026 | Fixed disclosure timeline | 🟨 [SECURITY.md](../SECURITY.md) |
 | 15 | Consistency of foundations | Proven consistent? | HOL family | Studied, not fully proven | Proven within a stronger system | ➖ |
 | 16 | Escape-hatch control | Every unchecked shortcut detected | Metamath (none exist) | `#print axioms`, comparator | Automatic, for every theorem | 🟨 `certus deps` lists axioms and flags `sorryAx`, unsafe and partial; matches `#print axioms` |
-| 17 | Statement auditing | Shows exactly what was proved | Nobody does this well | comparator (new) | Audit report per theorem | 🟨 axioms + closure size; statement printing next |
+| 17 | Statement auditing | Shows exactly what was proved | Nobody does this well | comparator (new) | Audit report per theorem | 🟨 `certus deps` prints the exact statement next to its axioms and closure size; `certus show` prints any constant's statement, with notation or `--raw` |
 | 18 | Reproducible verdicts | Same input, same verdict, bit for bit | Metamath | Toolchain drift | Bit-for-bit | 🟨 deterministic root hash per export |
 | 19 | Cache integrity | Corruption caught | Nobody | Fragile | Every entry checked by hash | 🟨 content hashes ([spec](spec/certificate-v0.md)) |
 
