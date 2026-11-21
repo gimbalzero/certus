@@ -10,6 +10,10 @@ gh workflow run mathlib-sample.yml -f sample_size=50 -f shards=20 -f seed=12
 
 The workflow is [`.github/workflows/mathlib-sample.yml`](../../.github/workflows/mathlib-sample.yml). The report appears in the run summary and in the `mathlib-sample-results` artifact (`results.md`, `results.json`, and every per-module record).
 
+## Results
+
+The latest committed run is in [`results/results.md`](results/results.md) (and `results.json`). The summary and the H1 verdict are in [`docs/HYPOTHESES.md`](../../docs/HYPOTHESES.md#evidence-so-far).
+
 ## What it does
 
 1. **Pins** Mathlib at tag `v4.36.0` (`fc4f59e5`) with its toolchain, Lean `v4.36.0`.
@@ -28,4 +32,5 @@ Category groups: *kernel* = `type checking`; *typeclass* = `typeclass inference`
 - The unit is a module, sampled uniformly, so big and small files count equally in the sample; the ratio-of-sums estimator weights them by time.
 - Each file is elaborated once, in a fresh process, on a shared cloud runner. Imports are timed as part of that process, so "imports" is per-file reloading, the **I** of the model. Idle waiting on dependency chains (**W**) cannot be seen from one file and is not measured.
 - Elaboration runs with Lean's default parallelism (4 threads). Profiler times are summed over threads, so they can exceed wall time.
+- Processes are timed by polling every 50 ms, so short steps are only accurate to about 50 ms. The in-process kernel replay times from `KernelReplay.lean` are exact.
 - The closure replays check every declaration the module depends on, back to `Init`, while elaboration re-does only the module itself. The like-for-like E2 figure is the same-module replay.
