@@ -1,0 +1,53 @@
+name: Lean Kernel Arena
+
+# Runs the Lean Kernel Arena test suite (https://arena.lean-lang.org) against
+# Certus. Fails only on a new false acceptance (a test that must be rejected
+# was accepted and is not yet tracked in tests/arena/known-unsound.txt).
+# False rejections and timeouts are reported in the job summary.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arena:
+    name: arena (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [round-2026-09, live]
+    # The pinned round gates; the live suite changes under us, so a new Arena
+    # test can only turn it red in the job summary, not block a pull request.
+    continue-on-error: ${{ matrix.suite == 'live' }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      # The pinned round never changes; the live suite is fetched fresh each run.
+      - uses: actions/cache@v4
+        if: matrix.suite != 'live'
+        with:
+          path: ~/.cache/certus-arena
+          key: certus-arena-${{ matrix.suite }}
+      - run: cargo build --release --locked
+      - name: Run the Arena tests
+        run: >
+          python3 -I tests/arena/run.py
+          --suite ${{ matrix.suite }}
+          --timeout 300
+          --json arena-${{ matrix.suite }}.json
+          --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arena-${{ matrix.suite }}
+          path: arena-${{ matrix.suite }}.json
+          if-no-files-found: ignore
