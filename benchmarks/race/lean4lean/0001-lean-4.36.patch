@@ -36,26 +36,6 @@ index afc942b..4a203e0 100644
        (moduleName2Idx := moduleName2Idx)
        (importAllModules := #[])
        (moduleData := moduleData))
-diff --git a/Lean4Lean/Primitive.lean b/Lean4Lean/Primitive.lean
-index d6569b2..419228d 100644
---- a/Lean4Lean/Primitive.lean
-+++ b/Lean4Lean/Primitive.lean
-@@ -618,7 +618,13 @@ run_meta
-   for c in Environment.primitives do
-     match env.find? c with
-     | some (.defnInfo v) =>
--      let (.true, _) ← Elab.Term.TermElabM.run (checkDef v)
--        | throwError "{v.name}"
-+      -- Lean 4.36 changed some of these definitions (e.g. `Nat.div`, `Nat.bitwise`) and the
-+      -- recognizers do not match them yet. Report instead of failing the build: checking a
-+      -- module against its imports never re-adds them, only `--fresh` would.
-+      try
-+        let (.true, _) ← Elab.Term.TermElabM.run (checkDef v)
-+          | logWarning m!"primitive recognizer did not run for {v.name}"
-+      catch e =>
-+        logWarning m!"primitive recognizer does not match {v.name} on this Lean: {e.toMessageData}"
-     | some (.inductInfo _) | some (.ctorInfo _) => pure ()
-     | r => throwError "unexpected primitive: {r.map (·.name)}"
 diff --git a/Lean4Lean/TypeChecker.lean b/Lean4Lean/TypeChecker.lean
 index 748a797..3ddd9b1 100644
 --- a/Lean4Lean/TypeChecker.lean
