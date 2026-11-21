@@ -46,5 +46,11 @@ Each copy has its own recursive definition, so this is 1,000 definitions and 1,0
 ```bash
 cargo build --release                         # at the repo root
 export PATH=/path/to/lean-4.36.0/bin:$PATH    # lean, leanexport, leanchecker, nanoda_bin, con-leche
-python3 benchmarks/race/race.py --runs 7
+python3 benchmarks/race/race.py --runs 7       # --json out.json for raw numbers
 ```
+
+Missing optional checkers (leanchecker, nanoda, con-leche, Metamath) are skipped with a note; `--require all` makes them mandatory. The script also feeds Certus seven tampered certificates and fails unless it rejects every one.
+
+## In CI
+
+`.github/workflows/race.yml` runs the race on every push to `main` (and on demand) on a GitHub Linux runner: Lean 4.36.0 via elan, lean4export, nanoda and con-leche built from pinned sources, Metamath and set.mm fetched as in `proof-bench/bench.sh`. The JSON and the tables are uploaded as the `race-results` artifact and shown in the run summary. The job fails if any checker rejects a valid certificate, if Certus accepts a tampered one, or if a checker is missing.
