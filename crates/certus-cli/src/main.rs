@@ -1,6 +1,6 @@
 //! `certus`: inspect Lean 4 kernel exports produced by `lean4export`.
 
-use certus_core::{Env, deps, hash, parse};
+use certus_core::{Env, deps, hash, parse, pretty};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -20,6 +20,10 @@ USAGE:
     certus deps  <export.ndjson> <Decl.Name> [--list]
         Everything <Decl.Name> depends on, and the axioms it rests on.
         With --list, print every declaration in the closure.
+    certus show  <export.ndjson> <Decl.Name> [--raw]
+        Print the kind, name, universe parameters and exact statement (type)
+        of a constant. --raw shows every argument, instance and universe level
+        instead of notation such as `a + b`.
 
     certus check <export.ndjson> [<Decl.Name>...]
         Type-check declarations with the Certus kernel. With names, check
@@ -41,6 +45,8 @@ fn main() -> ExitCode {
         Some("hash") if args.len() == 4 && args[2] == "--manifest" => hash_cmd(&args[1], Some(&args[3])),
         Some("deps") if args.len() == 3 => deps_cmd(&args[1], &args[2], false),
         Some("deps") if args.len() == 4 && args[3] == "--list" => deps_cmd(&args[1], &args[2], true),
+        Some("show") if args.len() == 3 => show_cmd(&args[1], &args[2], false),
+        Some("show") if args.len() == 4 && args[3] == "--raw" => show_cmd(&args[1], &args[2], true),
         Some("check") if args.len() >= 2 => with_big_stack(move || check_cmd(&args[1], &args[2..])),
         Some("extract") if args.len() >= 4 => extract_cmd(&args[1], &args[2], &args[3..]),
         Some("-h" | "--help" | "help") => {
@@ -142,6 +148,9 @@ fn deps_cmd(path: &str, name: &str, list: bool) -> Result<(), String> {
 
     let d = &env.decls[idx];
     println!("{} {}", d.kind(), env.name_str(d.primary_name()));
+    if let Some(c) = pretty::const_info(&env, d.primary_name()) {
+        println!("statement: {}", pretty::statement(&env, &c, pretty::Options::NOTATION));
+    }
     println!(
         "depends on {} of {} declarations ({:.1}%) and {} of {} expression nodes ({:.1}%); computed in {:.3} s",
         c.decls.len(),
@@ -184,6 +193,18 @@ fn deps_cmd(path: &str, name: &str, list: bool) -> Result<(), String> {
             println!("{}\t{}", env.decls[i].kind(), env.name_str(env.decls[i].primary_name()));
         }
     }
+    Ok(())
+}
+
+fn show_cmd(path: &str, name: &str, raw: bool) -> Result<(), String> {
+    let env = load(path)?;
+    let c = pretty::find_const(&env, name).ok_or_else(|| format!("no declaration named {name} in {path}"))?;
+    let opts = if raw { pretty::Options::RAW } else { pretty::Options::NOTATION };
+    let params: Vec<String> = c.level_params.iter().map(|&p| pretty::name_to_string(&env, p)).collect();
+    println!("kind: {}", c.kind);
+    println!("name: {}", pretty::name_to_string(&env, c.name));
+    println!("universe params: {}", if params.is_empty() { "(none)".to_string() } else { params.join(" ") });
+    println!("type: {}", pretty::statement(&env, &c, opts));
     Ok(())
 }
 
