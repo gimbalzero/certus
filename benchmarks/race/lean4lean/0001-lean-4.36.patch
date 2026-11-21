@@ -36,6 +36,22 @@ index afc942b..4a203e0 100644
        (moduleName2Idx := moduleName2Idx)
        (importAllModules := #[])
        (moduleData := moduleData))
+diff --git a/Lean4Lean/Primitive.lean b/Lean4Lean/Primitive.lean
+index d6569b2..2ddd75e 100644
+--- a/Lean4Lean/Primitive.lean
++++ b/Lean4Lean/Primitive.lean
+@@ -566,7 +566,10 @@ is covered by the top equation `div x y ≡ if 1 ≤ y then go y _ (succ x) x _
+   unless env.contains ``Nat.sub && env.contains ``Bool && ok v do fail v
+   -- div : Nat → Nat → Nat
+   unless eraseMData v.type == q(Nat → Nat → Nat) do fail v
+-  checkNatFuelRec v ``Nat.div.go (lhs := id) (H := succ) (els := fun _ => zero)
++  -- Lean 4.36 counts the steps with `go … + 1` where earlier versions used `succ (go …)`.
++  checkNatFuelRec v ``Nat.div.go (lhs := id)
++    (H := fun e => mkApp2 q(@HAdd.hAdd Nat Nat Nat (@instHAdd Nat instAddNat)) e q((1 : Nat)))
++    (els := fun _ => zero)
+     (top := fun go x y =>
+       Condition.natLE.dite #[one, y]
+         (go y (.bvar 0) (succ x) x (mkApp q(Nat.lt_succ_self) x)) zero)
 diff --git a/Lean4Lean/TypeChecker.lean b/Lean4Lean/TypeChecker.lean
 index 748a797..3ddd9b1 100644
 --- a/Lean4Lean/TypeChecker.lean
