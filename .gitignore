@@ -1,0 +1,4 @@
+/target
+.DS_Store
+# Lean exports are large; generate them locally.
+*.ndjson

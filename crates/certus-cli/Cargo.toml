@@ -1,0 +1,15 @@
+[package]
+name = "certus-cli"
+description = "Command-line tool for Certus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "certus"
+path = "src/main.rs"
+
+[dependencies]
+certus-core = { path = "../certus-core" }

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/certus-core", "crates/certus-cli"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/gimbalzero/certus"
+rust-version = "1.85"
+
+[workspace.dependencies]
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

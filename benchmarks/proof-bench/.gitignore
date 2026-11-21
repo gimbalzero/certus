@@ -1,0 +1,9 @@
+lean/olean/
+lean/export/
+lean/Gen_*.lean
+lean/prof_*.txt
+lean/time_*.txt
+lean/SumProf.lean
+metamath/src/
+metamath/metamath
+metamath/set.mm
