@@ -51,8 +51,9 @@ jobs:
           "$prefix/bin/lean" --version
           ls "$prefix/bin"
 
-      - name: Cache tool builds
-        uses: actions/cache@v4
+      - name: Restore tool builds
+        id: tools-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/tools/lean4export/.lake
@@ -114,6 +115,17 @@ jobs:
           lake update batteries
           lake build lean4lean
           ln -sf "$d/.lake/build/bin/lean4lean" "$HOME/race-bin/lean4lean"
+
+      - name: Save tool builds (even if a later step fails)
+        if: always() && steps.tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/tools/lean4export/.lake
+            ~/tools/con-leche/.lake
+            ~/tools/lean4lean/.lake
+            ~/tools/cargo
+          key: race-tools-${{ runner.os }}-${{ env.LEAN_TOOLCHAIN }}-${{ env.LEAN4EXPORT_REV }}-${{ env.CONLECHE_REV }}-${{ env.LEAN4LEAN_REV }}-${{ hashFiles('benchmarks/race/lean4lean/**') }}-${{ env.NANODA_REV }}
 
       - name: Metamath and set.mm
         run: |
