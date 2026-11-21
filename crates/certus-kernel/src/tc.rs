@@ -74,7 +74,7 @@ impl<'a> TC<'a> {
         Ok(())
     }
 
-    /// Strip `optParam T d`, `autoParam T t` and `outParam T` down to `T`,
+    /// Strip `optParam T d`, `autoParam T t`, `outParam T` and `semiOutParam T` down to `T`,
     /// as Lean's kernel does when it introduces binders of inductive types.
     pub fn consume_annotations(&self, mut e: E) -> E {
         let b = &self.env.builtins;
@@ -82,7 +82,9 @@ impl<'a> TC<'a> {
             let (h, args) = self.st.spine(e);
             let Node::Const(n, _) = self.st.node(h) else { return e };
             let n = Some(n);
-            if ((n == b.opt_param || n == b.auto_param) && args.len() == 2) || (n == b.out_param && args.len() == 1) {
+            if ((n == b.opt_param || n == b.auto_param) && args.len() == 2)
+                || ((n == b.out_param || n == b.semi_out_param) && args.len() == 1)
+            {
                 e = args[0];
             } else {
                 return e;
