@@ -12,13 +12,14 @@ jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - uses: actions/checkout@v5
+      # rust-toolchain.toml pins the exact version; rustup installs it on first use.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo --version && cargo clippy --version
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
