@@ -110,6 +110,14 @@ fn stats(path: &str) -> Result<(), String> {
         h.exprs.len(),
         100.0 * (1.0 - unique.len() as f64 / h.exprs.len().max(1) as f64)
     );
+    let alpha = hash::hash_env_alpha(&env);
+    let unique_alpha: HashSet<&hash::Hash> = alpha.exprs.iter().collect();
+    println!(
+        "unique expressions up to alpha (spec v1 draft): {} of {} ({:.2}% fewer than by exact content)",
+        unique_alpha.len(),
+        h.exprs.len(),
+        100.0 * (1.0 - unique_alpha.len() as f64 / unique.len().max(1) as f64)
+    );
     let dup_names = env.name_canon.iter().enumerate().filter(|(i, c)| *i as u32 != **c).count();
     println!("duplicate name records: {dup_names}");
     println!("root {}", hash::hex(&h.root));

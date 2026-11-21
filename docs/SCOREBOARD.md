@@ -74,6 +74,6 @@ Status key: ⬜ not started · 🟨 started · 🟩 measured win · ➖ out of s
 | # | Axis | Measure | Best today | Lean 4 | Certus target | Status |
 |---|---|---|---|---|---|---|
 | 41 | Distributed checking | Community splits the work | Nobody | No | Volunteer chunks | ⬜ spec §4 |
-| 42 | Proof compression | Bytes per step | Metamath compressed proofs | lean4export already shares every repeated node (0% unshared repeats, [measured](HYPOTHESES.md)) | Smaller than Metamath | 🟨 next: alpha-normal dedup |
+| 42 | Proof compression | Bytes per step | Metamath compressed proofs | lean4export already shares every repeated node, even up to alpha (0% unshared repeats; alpha-normal hashing saves 0.00% of 6.1M nodes, [measured](HYPOTHESES.md)) | Smaller than Metamath | 🟨 dedup exhausted ([spec v1](spec/certificate-v1.md)); next: denser encoding |
 | 43 | Cheap outside verification | Cost to confirm a result | zkPi (research) | Rebuild everything | Seconds, then zk proofs | 🟨 check only the closure: 0.1–2.3% of the core library for our test theorems |
 | 44 | Very large projects | 10M+ lines | Nobody tested | RH proof: the first real test, slow | 100M lines on a laptop | ⬜ |

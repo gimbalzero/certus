@@ -1,6 +1,7 @@
 //! Content hashes for names, levels, expressions and declarations.
 //!
-//! The encoding is specified in `docs/spec/certificate-v0.md`. In short:
+//! The encoding is specified in `docs/spec/certificate-v0.md` (faithful mode)
+//! and `docs/spec/certificate-v1.md` (alpha-normal mode). In short:
 //! `key = BLAKE3-derive_key(CONTEXT, "")`, and every node hash is
 //! `BLAKE3-keyed(key, tag || fields)`, where child nodes appear as their
 //! 32-byte hashes, integers as 8-byte little-endian, booleans as one byte,
@@ -8,12 +9,40 @@
 //!
 //! v0 hashes the export *faithfully*: binder names and binder info are
 //! included, so alpha-equivalent terms get different hashes.
+//!
+//! v1 (draft) adds an *alpha-normal* mode with its own key: lambda, pi and
+//! let nodes omit the binder name and binder info (for let, the `nondep`
+//! flag), so alpha-equivalent terms share a hash. Everything else is encoded
+//! exactly as in v0.
 
 use crate::export::*;
 
 pub type Hash = [u8; 32];
 
+/// Derive-key context for the faithful (v0) hash.
 pub const CONTEXT: &str = "certus certificate v0 2026-11-20 node hash";
+
+/// Derive-key context for the alpha-normal (v1 draft) hash.
+pub const CONTEXT_ALPHA: &str = "certus certificate v1-alpha 2026-11-21 alpha-normal node hash";
+
+/// Which content hash to compute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Spec v0: binder names and binder info are hashed.
+    Faithful,
+    /// Spec v1 (draft): binder names and binder info are omitted, so
+    /// alpha-equivalent terms share a hash.
+    AlphaNormal,
+}
+
+impl Mode {
+    pub fn context(self) -> &'static str {
+        match self {
+            Mode::Faithful => CONTEXT,
+            Mode::AlphaNormal => CONTEXT_ALPHA,
+        }
+    }
+}
 
 pub mod tag {
     pub const NAME_ANON: u8 = 0x00;
@@ -52,8 +81,13 @@ pub struct Hashes {
     pub root: Hash,
 }
 
+/// The faithful (v0) key.
 pub fn key() -> [u8; 32] {
-    blake3::derive_key(CONTEXT, &[])
+    key_for(Mode::Faithful)
+}
+
+pub fn key_for(mode: Mode) -> [u8; 32] {
+    blake3::derive_key(mode.context(), &[])
 }
 
 struct Enc(blake3::Hasher);
@@ -102,9 +136,29 @@ fn binder_byte(bi: BinderInfo) -> u64 {
     }
 }
 
+/// Lambda or pi node. In alpha-normal mode the binder name and info are omitted.
+fn binder(k: &[u8; 32], tag: u8, faithful: bool, name: &Hash, bi: BinderInfo, ty: Hash, body: Hash) -> Hash {
+    let mut enc = Enc::new(k, tag);
+    if faithful {
+        enc.h(name).u64(binder_byte(bi));
+    }
+    enc.h(&ty).h(&body).done()
+}
+
+/// Faithful (spec v0) hashes.
 pub fn hash_env(env: &Env) -> Hashes {
+    hash_env_with(env, Mode::Faithful)
+}
+
+/// Alpha-normal (spec v1 draft) hashes.
+pub fn hash_env_alpha(env: &Env) -> Hashes {
+    hash_env_with(env, Mode::AlphaNormal)
+}
+
+pub fn hash_env_with(env: &Env, mode: Mode) -> Hashes {
     use tag::*;
-    let k = key();
+    let k = key_for(mode);
+    let faithful = mode == Mode::Faithful;
 
     let mut names: Vec<Hash> = Vec::with_capacity(env.names.len());
     for n in &env.names {
@@ -139,18 +193,18 @@ pub fn hash_env(env: &Env) -> Hashes {
             }
             Expr::App { f, a } => Enc::new(&k, EXPR_APP).h(&x(*f)).h(&x(*a)).done(),
             Expr::Lam { name, ty, body, bi } => {
-                Enc::new(&k, EXPR_LAM).h(&names[*name as usize]).u64(binder_byte(*bi)).h(&x(*ty)).h(&x(*body)).done()
+                binder(&k, EXPR_LAM, faithful, &names[*name as usize], *bi, x(*ty), x(*body))
             }
             Expr::Pi { name, ty, body, bi } => {
-                Enc::new(&k, EXPR_PI).h(&names[*name as usize]).u64(binder_byte(*bi)).h(&x(*ty)).h(&x(*body)).done()
+                binder(&k, EXPR_PI, faithful, &names[*name as usize], *bi, x(*ty), x(*body))
             }
-            Expr::Let { name, ty, val, body, nondep } => Enc::new(&k, EXPR_LET)
-                .h(&names[*name as usize])
-                .bool(*nondep)
-                .h(&x(*ty))
-                .h(&x(*val))
-                .h(&x(*body))
-                .done(),
+            Expr::Let { name, ty, val, body, nondep } => {
+                let mut enc = Enc::new(&k, EXPR_LET);
+                if faithful {
+                    enc.h(&names[*name as usize]).bool(*nondep);
+                }
+                enc.h(&x(*ty)).h(&x(*val)).h(&x(*body)).done()
+            }
             Expr::NatLit(s) => Enc::new(&k, EXPR_NAT).bytes(s.as_bytes()).done(),
             Expr::StrLit(s) => Enc::new(&k, EXPR_STR).bytes(s.as_bytes()).done(),
             Expr::Proj { type_name, idx, structure } => {
