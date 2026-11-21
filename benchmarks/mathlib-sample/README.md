@@ -25,12 +25,12 @@ The latest committed run is in [`results/results.md`](results/results.md) (and `
    - **E2, whole closure:** lists the module's own declarations ([`lean/ModuleDecls.lean`](lean/ModuleDecls.lean)), exports them and everything they depend on with `lean4export`, and replays that closure with **nanoda**, with Lean's kernel (`leanchecker --from-export`), and with **Certus** (`certus extract` + `certus check`), recording what Certus rejects as unsupported.
 5. [`aggregate.py`](aggregate.py) combines the shards. Shares are ratios of sums over the sampled modules, with 95% percentile-bootstrap intervals (modules resampled, 10,000 times).
 
-Category groups: *kernel* = `type checking`; *typeclass* = `typeclass inference`; *tactics* = `tactic execution`, `simp` and similar; *interpreted meta code* = `interpretation` (Mathlib's own tactics are not precompiled, so they run in the interpreter); *imports* = `import` + `initialization`; then code generation, linting and other elaboration.
+Category groups: *kernel* = `type checking`; *typeclass* = `typeclass inference`; *tactics* = `tactic execution`, `simp` and similar; *interpreted meta code* = `interpretation` (Mathlib's own tactics are not precompiled, so they run in the interpreter); *imports* = `import` + `initialization`; *waiting* = `blocked (unaccounted)`; *linting* = every linter; then code generation with `.olean` output, and other elaboration.
 
 ## Caveats
 
 - The unit is a module, sampled uniformly, so big and small files count equally in the sample; the ratio-of-sums estimator weights them by time.
-- Each file is elaborated once, in a fresh process, on a shared cloud runner. Imports are timed as part of that process, so "imports" is per-file reloading, the **I** of the model. Idle waiting on dependency chains (**W**) cannot be seen from one file and is not measured.
+- Each file is elaborated once, in a fresh process, on a shared cloud runner. Imports are timed as part of that process, so "imports" is per-file reloading, the **I** of the model. Lean's `blocked (unaccounted)` category is reported as waiting, but it covers only threads waiting inside one file; idle cores across a whole build's dependency chains (the rest of **W**) cannot be seen from one file and are not measured.
 - Elaboration runs with Lean's default parallelism (4 threads). Profiler times are summed over threads, so they can exceed wall time.
 - Processes are timed by polling every 50 ms, so short steps are only accurate to about 50 ms. The in-process kernel replay times from `KernelReplay.lean` are exact.
 - The closure replays check every declaration the module depends on, back to `Init`, while elaboration re-does only the module itself. The like-for-like E2 figure is the same-module replay.
