@@ -1,6 +1,7 @@
 use certus_core::{Env, deps, hash, parse};
 
 const TINY: &str = include_str!("fixtures/tiny.ndjson");
+const ALPHA: &str = include_str!("fixtures/alpha.ndjson");
 
 fn env_of(s: &str) -> Env {
     parse(s.as_bytes()).expect("fixture parses")
@@ -82,6 +83,52 @@ fn hash_v0_is_pinned() {
 }
 
 #[test]
+fn hash_alpha_is_pinned() {
+    // Changing these values is a breaking change to spec v1 (alpha-normal mode).
+    let tiny = hash::hex(&hash::hash_env_alpha(&env_of(TINY)).root);
+    assert_eq!(tiny, "3b4e75815a2e0ab06cd7b9733d8b6a2896501c6a041c1822b34733dabb5e8550");
+    let alpha = hash::hex(&hash::hash_env_alpha(&env_of(ALPHA)).root);
+    assert_eq!(alpha, "68baf0795614185d7d75a6e5f71cf2fd8174a56810a48558e9bcaca296f0b77a");
+}
+
+#[test]
+fn alpha_mode_uses_its_own_key() {
+    // TINY has no binders, so only the key differs between the two modes.
+    let env = env_of(TINY);
+    let (v0, v1) = (hash::hash_env(&env), hash::hash_env_alpha(&env));
+    assert_ne!(v0.root, v1.root);
+    assert_ne!(v0.exprs[0], v1.exprs[0]);
+    assert_eq!(hash::hash_env_with(&env, hash::Mode::Faithful).root, v0.root);
+}
+
+#[test]
+fn alpha_equivalent_terms_collide_only_in_alpha_mode() {
+    let env = env_of(ALPHA);
+    let v0 = hash::hash_env(&env);
+    let v1 = hash::hash_env_alpha(&env);
+    // Pairs that differ only in binder name and binder info (or `nondep`).
+    for (a, b) in [(3, 4), (5, 6), (7, 8)] {
+        assert_ne!(v0.exprs[a], v0.exprs[b], "v0 must tell exprs {a} and {b} apart");
+        assert_eq!(v1.exprs[a], v1.exprs[b], "alpha mode must identify exprs {a} and {b}");
+    }
+    // Different structure still differs: `forall x : Prop, x` vs `forall x : Prop, P`,
+    // and pi vs lambda vs let over the same parts.
+    assert_ne!(v1.exprs[3], v1.exprs[9]);
+    assert_ne!(v1.exprs[3], v1.exprs[5]);
+    assert_ne!(v1.exprs[5], v1.exprs[7]);
+    // Declaration names are still hashed, so ax1 and ax2 remain distinct.
+    assert_ne!(v1.decls[1], v1.decls[2]);
+}
+
+#[test]
+fn renaming_a_binder_changes_only_the_v0_root() {
+    let base = env_of(ALPHA);
+    let renamed = env_of(&ALPHA.replace("\"str\":\"x\"", "\"str\":\"z\""));
+    assert_ne!(hash::hash_env(&base).root, hash::hash_env(&renamed).root);
+    assert_eq!(hash::hash_env_alpha(&base).root, hash::hash_env_alpha(&renamed).root);
+}
+
+#[test]
 fn flags_unsafe_and_partial() {
     let partial = TINY.replace("\"safety\":\"safe\"", "\"safety\":\"partial\"");
     let env = env_of(&partial);
@@ -128,4 +175,25 @@ fn rejects_missing_or_misplaced_meta() {
 fn rejects_malformed_nat_literal() {
     let bad = TINY.replace("{\"ie\":0,\"sort\":0}", "{\"ie\":0,\"natVal\":\"007\"}");
     assert!(err_of(&bad).contains("natural-number literal"));
+}
+
+/// Real lean4export 3.1.0 output (Lean 4.36) for
+/// `theorem alphaT1 : ∀ (a : Nat), a = a := fun a => rfl` and
+/// `theorem alphaT2 : ∀ {b : Nat}, b = b := fun {b} => rfl`, exported in both orders.
+/// lean4export shares terms up to alpha *and binder info*, so whichever theorem is
+/// exported first decides the binder name and info both theorems carry.
+const ORDER_12: &str = include_str!("fixtures/alpha_order_12.ndjson");
+const ORDER_21: &str = include_str!("fixtures/alpha_order_21.ndjson");
+
+#[test]
+fn alpha_hash_does_not_depend_on_export_order() {
+    let decl_hash = |src: &str, name: &str, alpha: bool| {
+        let env = env_of(src);
+        let h = if alpha { hash::hash_env_alpha(&env) } else { hash::hash_env(&env) };
+        h.decls[env.find_decl(name).unwrap()]
+    };
+    for name in ["alphaT1", "alphaT2"] {
+        assert_ne!(decl_hash(ORDER_12, name, false), decl_hash(ORDER_21, name, false), "{name} v0");
+        assert_eq!(decl_hash(ORDER_12, name, true), decl_hash(ORDER_21, name, true), "{name} alpha");
+    }
 }

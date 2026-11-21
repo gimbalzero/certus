@@ -77,7 +77,7 @@ Fields are encoded as follows:
 | 0x35 | inductive block | types, then ctors, then recs: each a counted list with all fields in export order |
 | 0x40 | environment root | counted list of declaration hashes, in file order |
 
-**v0 hashes faithfully.** Binder names and binder info are included, so alpha-equivalent terms hash differently. This keeps the hash a fingerprint of exactly what was exported. An alpha-normal hash, for better deduplication, is planned for v1.
+**v0 hashes faithfully.** Binder names and binder info are included, so alpha-equivalent terms hash differently. This keeps the hash a fingerprint of exactly what was exported. Note that lean4export itself shares terms up to alpha-equivalence and binder info, so the binder names and info in an export can come from another occurrence of the same term. An alpha-normal hash, stable across exports, is defined in [v1 (draft)](certificate-v1.md).
 
 Reference value: `crates/certus-core/tests/fixtures/tiny.ndjson` has root `dedd4861dc32db3cbfb519ce2d1a3aa417993fcf5981a96b92c21b00f0a44587`.
 
