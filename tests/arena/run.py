@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -173,39 +174,49 @@ def first_line(text: str, needle: str) -> str:
     return lines[-1].strip() if lines else ""
 
 
-def limit_memory(gb: float):
-    """A preexec_fn capping the child's address space (enforced on Linux, not on macOS)."""
-    if gb <= 0 or not sys.platform.startswith("linux"):
-        return None
-    import resource
-
-    def apply() -> None:
-        n = int(gb * (1 << 30))
-        resource.setrlimit(resource.RLIMIT_AS, (n, n))
-
-    return apply
+def rss_bytes(pid: int) -> int:
+    """Resident memory of a running process, or 0 if unknown."""
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout
+        return int(out.strip() or 0) * 1024
+    except (OSError, ValueError):
+        return 0
 
 
 def run_one(certus: Path, test: dict, timeout: float, memory_gb: float) -> dict:
+    """Run one test, killing it if it exceeds the time or resident-memory limit."""
     t0 = time.monotonic()
-    try:
-        p = subprocess.run(
-            [str(certus), "check", str(test["path"])],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            preexec_fn=limit_memory(memory_gb),
-        )
-    except subprocess.TimeoutExpired:
-        return {**test, "verdict": "timeout", "reason": f"no verdict after {timeout:.0f} s", "secs": timeout}
-    secs = time.monotonic() - t0
-    out = p.stdout + p.stderr
-    if p.returncode == 0 and "OK:" in p.stdout:
-        verdict, reason = "accept", first_line(p.stdout, "OK:")
+    limit = memory_gb * (1 << 30)
+    with tempfile.TemporaryFile("w+") as out_f, tempfile.TemporaryFile("w+") as err_f:
+        p = subprocess.Popen([str(certus), "check", str(test["path"])], stdout=out_f, stderr=err_f, text=True)
+        killed = None
+        while p.poll() is None:
+            secs = time.monotonic() - t0
+            if secs > timeout:
+                killed = ("timeout", f"no verdict after {timeout:.0f} s")
+            elif limit > 0 and rss_bytes(p.pid) > limit:
+                killed = ("error", f"exceeded the {memory_gb:g} GB memory limit")
+            if killed:
+                p.kill()
+                p.wait()
+                break
+            time.sleep(0.1 if secs < 2 else 0.5)
+        secs = time.monotonic() - t0
+        out_f.seek(0)
+        err_f.seek(0)
+        stdout, stderr = out_f.read(), err_f.read()
+    if killed:
+        return {**test, "verdict": killed[0], "reason": killed[1], "secs": secs}
+    out = stdout + stderr
+    if p.returncode == 0 and "OK:" in stdout:
+        verdict, reason = "accept", first_line(stdout, "OK:")
     elif p.returncode == 1 and "panicked" not in out:
-        verdict, reason = "reject", first_line(p.stderr, "error:").removeprefix("error: ")
-    elif "memory allocation" in out:
-        verdict, reason = "error", f"exceeded the {memory_gb:g} GB memory limit"
+        verdict, reason = "reject", first_line(stderr, "error:").removeprefix("error: ")
     else:
         verdict, reason = "error", f"exit {p.returncode}: {first_line(out, 'panicked')}"
     return {**test, "verdict": verdict, "reason": reason, "secs": secs}
@@ -229,7 +240,7 @@ def main() -> int:
     ap.add_argument("--refresh", action="store_true", help="re-download unpinned suites")
     ap.add_argument("--timeout", type=float, default=300.0, help="seconds per test (default: %(default)s)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1)
-    ap.add_argument("--memory-limit", type=float, default=4.0, help="GB of address space per test, Linux only; 0 for none (default: %(default)s)")
+    ap.add_argument("--memory-limit", type=float, default=4.0, help="GB of resident memory per test; 0 for none (default: %(default)s)")
     ap.add_argument("-k", "--filter", default="", help="only run tests whose name contains this")
     ap.add_argument("--json", type=Path, help="write per-test results here")
     ap.add_argument("--summary", type=Path, help="append a Markdown summary here (e.g. $GITHUB_STEP_SUMMARY)")
