@@ -323,13 +323,17 @@ impl<'a> TC<'a> {
     }
 
     /// Is `t` a proposition, i.e. `t : Prop`?
+    ///
+    /// The type of `t` must reduce to a sort; otherwise `t` is not a type and
+    /// this fails with "type expected". It must never answer "not a
+    /// proposition" for a type whose sort is stuck: callers such as
+    /// `infer_proj` would then treat a proof as data and allow projecting data
+    /// out of it, which together with proof irrelevance proves `False`
+    /// (issue #17; Lean fixed the same hole in leanprover/lean4#14807).
     pub fn is_proof_type(&mut self, t: E) -> R<bool> {
         let s = self.infer(t, false)?;
-        let s = self.whnf(s)?;
-        Ok(match self.st.node(s) {
-            Node::Sort(l) => self.st.is_zero(l),
-            _ => false,
-        })
+        let l = self.ensure_sort(s)?;
+        Ok(self.st.is_zero(l))
     }
 
     // ------------------------------------------------------------------
