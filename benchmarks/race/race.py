@@ -12,8 +12,11 @@ Optional contestants, skipped with a note when missing (unless --require
 names them): leanchecker, nanoda_bin, con-leche, and Metamath (an executable
 and set.mm in ../proof-bench/metamath, see ../proof-bench/bench.sh).
 
-Round 1: 2·(0+1+…+n) = n(n+1), one theorem.
+Round 1: 2·(0+1+…+n) = n(n+1), one theorem, explicit proof (named rewrites).
 Round 2: 1,000 copies of it, each with its own recursive definition.
+Round 3: the same theorem proved by automation (simp + omega), whose proof
+         term pulls in Lean's omega library and the nested type Lean.Syntax.
+Round 4: 1,000 copies of the automated proof.
 Every checker except Lean-from-source reads the same certificate: the
 theorems plus every declaration they depend on, back to the definitions of
 Nat and Eq (made with `certus extract`).
@@ -40,6 +43,7 @@ LEAN_DIR = os.path.join(BENCH, "lean")
 MM_DIR = os.path.join(BENCH, "metamath")
 CERTUS = os.path.join(ROOT, "target", "release", "certus")
 THM1 = "sum_formula_explicit"
+THM_AUTO = "sum_formula_auto"
 
 # Tool names accepted by --require.
 OPTIONAL_TOOLS = ["leanchecker", "nanoda", "con-leche", "metamath"]
@@ -91,13 +95,27 @@ def lean_env():
 def make_certificate(work, module, theorems, env):
     os.makedirs(os.path.join(LEAN_DIR, "olean"), exist_ok=True)
     sh(["lean", "-o", f"olean/{module}.olean", f"{module}.lean"], cwd=LEAN_DIR, env=env)
-    export = os.path.join(work, f"{module}.ndjson")
-    with open(export, "w") as f:
-        subprocess.run(["leanexport", module], cwd=LEAN_DIR, env=env, stdout=f, check=True)
-    cert = os.path.join(work, f"{module}.cert.ndjson")
-    sh([CERTUS, "extract", export, cert, *theorems])
-    os.remove(export)
+    # Stream the full export (hundreds of MB) straight into `certus extract`
+    # so it never touches the disk.
+    cert = os.path.join(work, f"{module}.{theorems[0]}.cert.ndjson")
+    export = subprocess.Popen(["leanexport", module], cwd=LEAN_DIR, env=env, stdout=subprocess.PIPE)
+    r = subprocess.run([CERTUS, "extract", "/dev/stdin", cert, *theorems], stdin=export.stdout,
+                       capture_output=True, text=True)
+    export.stdout.close()
+    if export.wait() != 0 or r.returncode != 0:
+        sys.exit(f"making the certificate for {module} failed (leanexport exit {export.returncode}, "
+                 f"certus extract exit {r.returncode})\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
     return cert
+
+
+def generated(n, style):
+    """Gen_<style>_<n>.lean from proof-bench/scripts/gen_lean.py, made if missing."""
+    module = f"Gen_{style}_{n}"
+    path = os.path.join(LEAN_DIR, f"{module}.lean")
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(sh([sys.executable, os.path.join(BENCH, "scripts", "gen_lean.py"), str(n), style]))
+    return module
 
 
 def nanoda_config(work, cert):
@@ -231,14 +249,17 @@ def main():
     work = tempfile.mkdtemp(prefix="certus-race-")
     failures = []
 
-    # Round 1: one theorem.
+    copies = [f"t{i}" for i in range(1000)]
+    # Round 1: one theorem, explicit proof.
     cert1 = make_certificate(work, "Sum", [THM1], env)
-    # Round 2: 1,000 theorems (generated if needed).
-    gen = os.path.join(LEAN_DIR, "Gen_explicit_1000.lean")
-    if not os.path.exists(gen):
-        with open(gen, "w") as f:
-            f.write(sh([sys.executable, os.path.join(BENCH, "scripts", "gen_lean.py"), "1000", "explicit"]))
-    cert2 = make_certificate(work, "Gen_explicit_1000", [f"t{i}" for i in range(1000)], env)
+    # Round 2: 1,000 copies of it.
+    gen2 = generated(1000, "explicit")
+    cert2 = make_certificate(work, gen2, copies, env)
+    # Round 3: the automated proof, from the same Sum.lean.
+    cert3 = make_certificate(work, "Sum", [THM_AUTO], env)
+    # Round 4: 1,000 copies of the automated proof.
+    gen4 = generated(1000, "auto")
+    cert4 = make_certificate(work, gen4, copies, env)
 
     ok_certus = lambda o: "OK:" in o
     ok_nanoda = lambda o: "no typechecker errors" in o
@@ -272,14 +293,39 @@ def main():
             ("certus", "Certus (certificate)", [CERTUS, "check", cert2], None, ok_certus),
             ("nanoda", "nanoda (certificate)", ["nanoda_bin", nanoda_config(work, cert2)], None, ok_nanoda),
             ("con-leche", "con-leche (certificate)", ["con-leche", cert2], None, ok_leche),
-            ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", "Gen_explicit_1000"],
+            ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", gen2],
              LEAN_DIR, ok_any),
-            ("lean", "Lean, build from source", ["lean", "Gen_explicit_1000.lean"], LEAN_DIR, ok_any),
+            ("lean", "Lean, build from source", ["lean", f"{gen2}.lean"], LEAN_DIR, ok_any),
             ("metamath", "Metamath: all of set.mm (48k theorems)",
              ["./metamath", "set scroll continuous", "read set.mm", "verify proof *", "exit"], MM_DIR, ok_mm),
         ],
+        # Sum.lean holds both proofs, so leanchecker and the Lean build do the
+        # same work in rounds 1 and 3.
+        "1 theorem, automated": [
+            ("certus", "Certus (certificate)", [CERTUS, "check", cert3], None, ok_certus),
+            ("nanoda", "nanoda (certificate)", ["nanoda_bin", nanoda_config(work, cert3)], None, ok_nanoda),
+            ("con-leche", "con-leche (certificate)", ["con-leche", cert3], None, ok_leche),
+            ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", "Sum"], LEAN_DIR,
+             ok_any),
+            ("lean", "Lean, build from source", ["lean", "Sum.lean"], LEAN_DIR, ok_any),
+        ],
+        # Metamath is a whole-library reference, not a check of this proof, so
+        # it runs once, in round 2.
+        "1,000 theorems, automated": [
+            ("certus", "Certus (certificate)", [CERTUS, "check", cert4], None, ok_certus),
+            ("nanoda", "nanoda (certificate)", ["nanoda_bin", nanoda_config(work, cert4)], None, ok_nanoda),
+            ("con-leche", "con-leche (certificate)", ["con-leche", cert4], None, ok_leche),
+            ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", gen4],
+             LEAN_DIR, ok_any),
+            ("lean", "Lean, build from source", ["lean", f"{gen4}.lean"], LEAN_DIR, ok_any),
+        ],
     }
-    sizes = {"1 theorem": os.path.getsize(cert1), "1,000 theorems": os.path.getsize(cert2)}
+    sizes = {
+        "1 theorem": os.path.getsize(cert1),
+        "1,000 theorems": os.path.getsize(cert2),
+        "1 theorem, automated": os.path.getsize(cert3),
+        "1,000 theorems, automated": os.path.getsize(cert4),
+    }
 
     skipped = {}
     for tool, (ok, why) in tools.items():
