@@ -82,7 +82,10 @@ pub struct Builtins {
     pub bool_true: Option<NameId>,
     pub bool_false: Option<NameId>,
     pub string: Option<NameId>,
+    /// The function string literals expand with: `String.ofList` where the
+    /// export declares it (Lean 4.22 on), otherwise `String.mk`.
     pub string_mk: Option<NameId>,
+    pub string_of_list: Option<NameId>,
     pub char: Option<NameId>,
     pub char_of_nat: Option<NameId>,
     pub list_nil: Option<NameId>,
@@ -147,6 +150,7 @@ impl Builtins {
             bool_false: lookup("Bool.false"),
             string: lookup("String"),
             string_mk: lookup("String.mk"),
+            string_of_list: lookup("String.ofList"),
             char: lookup("Char"),
             char_of_nat: lookup("Char.ofNat"),
             list_nil: lookup("List.nil"),

@@ -156,8 +156,31 @@ fn check_on_this_thread(env: &Env, decls: &[usize]) -> Result<Report, CheckError
     }
     // Native Nat arithmetic is only switched on once `Nat` and each operation
     // have been checked to be the genuine ones (see `activate_nat`).
-    let candidates = Builtins::resolve(|s| by_str.get(s).copied());
-    kenv.builtins = Builtins { nat: None, nat_zero: None, nat_succ: None, nat_ops: Vec::new(), ..candidates.clone() };
+    let mut candidates = Builtins::resolve(|s| by_str.get(s).copied());
+    // Lean 4.22 on expands string literals with `String.ofList` (`String.mk`
+    // became a deprecated alias); earlier versions with the constructor `String.mk`.
+    if let Some(n) = candidates.string_of_list
+        && env.decl_of_name.contains_key(&n)
+    {
+        candidates.string_mk = Some(n);
+    }
+    // Likewise string literals are only typed and expanded once `String`,
+    // `String.mk`, `Char`, `Char.ofNat`, `List.nil` and `List.cons` have been
+    // checked to have their standard shapes (see `activate_string`).
+    kenv.builtins = Builtins {
+        nat: None,
+        nat_zero: None,
+        nat_succ: None,
+        nat_ops: Vec::new(),
+        string: None,
+        string_mk: None,
+        string_of_list: None,
+        char: None,
+        char_of_nat: None,
+        list_nil: None,
+        list_cons: None,
+        ..candidates.clone()
+    };
 
     let mut conv = Conv { ex: env, exprs: vec![None; env.exprs.len()], levels: vec![None; env.levels.len()] };
     let mut counts: FxHashMap<&'static str, usize> = FxHashMap::default();
@@ -176,6 +199,7 @@ fn check_on_this_thread(env: &Env, decls: &[usize]) -> Result<Report, CheckError
         }
         for n in added {
             activate_nat(&mut st, &mut kenv, &candidates, n, &strs);
+            activate_string(&mut st, &mut kenv, &candidates, n);
         }
         *counts.entry(d.kind()).or_default() += 1;
         times.push((i, t0.elapsed()));
@@ -256,6 +280,109 @@ fn activate_nat(st: &mut Store, kenv: &mut KEnv, cand: &Builtins, n: NameId, str
     if GENUINE_NAT_OPS.iter().any(|(s, f)| *s == strs[n as usize] && *f == fp) {
         kenv.builtins.nat_ops.push((n, op));
     }
+}
+
+/// Switch on string literals once all the constants their expansion
+/// `String.ofList [Char.ofNat c₁, …]` uses are present with their standard
+/// shapes, so that a literal's expansion is well typed and has type `String`:
+///
+/// - `List.{u} : Type u → Type u`, an inductive type whose constructors are
+///   exactly `List.nil.{u} : {α : Type u} → List α` and
+///   `List.cons.{u} : {α : Type u} → α → List α → List α`;
+/// - `Char : Type` and `String : Type`, inductive types without parameters or
+///   indices;
+/// - `Char.ofNat : Nat → Char`, a definition (requires the verified `Nat`);
+/// - the expansion function `String.ofList : List Char → String`, a definition
+///   (Lean 4.22 on, where `String` wraps a `ByteArray`), or before that
+///   `String.mk : List Char → String`, the constructor of `String`.
+///
+/// Until then, string literals are rejected.
+fn activate_string(st: &mut Store, kenv: &mut KEnv, cand: &Builtins, n: NameId) {
+    let names = [cand.string, cand.string_mk, cand.char, cand.char_of_nat, cand.list_nil, cand.list_cons];
+    if kenv.builtins.string.is_some() || !names.contains(&Some(n)) {
+        return;
+    }
+    let (Some(string_n), Some(mk_n), Some(char_n), Some(of_nat_n), Some(nil_n), Some(cons_n), Some(nat_n)) =
+        (cand.string, cand.string_mk, cand.char, cand.char_of_nat, cand.list_nil, cand.list_cons, kenv.builtins.nat)
+    else {
+        return;
+    };
+    let get = |n: NameId| kenv.get(n);
+    let (Some(string), Some(mk), Some(chr), Some(of_nat), Some(nil), Some(cons)) =
+        (get(string_n), get(mk_n), get(char_n), get(of_nat_n), get(nil_n), get(cons_n))
+    else {
+        return;
+    };
+    // `List`: the inductive type of both constructors.
+    let Kind::Ctor { induct: list_n, cidx: 0, num_params: 1, num_fields: 0 } = nil.kind else { return };
+    if !matches!(cons.kind, Kind::Ctor { induct, cidx: 1, num_params: 1, num_fields: 2 } if induct == list_n) {
+        return;
+    }
+    let Some(list) = kenv.get(list_n) else { return };
+    let Kind::Induct { num_params: 1, num_indices: 0, ctors, .. } = &list.kind else { return };
+    let ([u_n], true) = (list.lparams.as_slice(), nil.lparams == list.lparams && cons.lparams == list.lparams) else {
+        return;
+    };
+    if ctors.as_slice() != [nil_n, cons_n] {
+        return;
+    }
+    let u = st.level(Level::Param(*u_n));
+    let type_u = {
+        let su = st.succ(u);
+        st.sort(su)
+    };
+    let list_u = st.cnst(list_n, &[u]);
+    let list_ty = st.mk(Node::Pi(type_u, type_u));
+    // {α : Type u} → List α
+    let b0 = st.bvar(0);
+    let list_b0 = st.app(list_u, b0);
+    let nil_ty = st.mk(Node::Pi(type_u, list_b0));
+    // {α : Type u} → α → List α → List α
+    let b1 = st.bvar(1);
+    let b2 = st.bvar(2);
+    let list_b1 = st.app(list_u, b1);
+    let list_b2 = st.app(list_u, b2);
+    let tail = st.mk(Node::Pi(list_b1, list_b2));
+    let head = st.mk(Node::Pi(b0, tail));
+    let cons_ty = st.mk(Node::Pi(type_u, head));
+    if list.ty != list_ty || nil.ty != nil_ty || cons.ty != cons_ty {
+        return;
+    }
+    // `Char` and `String`: types without parameters or indices.
+    let type0 = {
+        let one = st.succ(st.zero);
+        st.sort(one)
+    };
+    for t in [&chr, &string] {
+        if !t.lparams.is_empty()
+            || t.ty != type0
+            || !matches!(t.kind, Kind::Induct { num_params: 0, num_indices: 0, .. })
+        {
+            return;
+        }
+    }
+    // `Char.ofNat : Nat → Char` and `String.mk : List Char → String`.
+    let nat_c = st.cnst(nat_n, &[]);
+    let char_c = st.cnst(char_n, &[]);
+    let string_c = st.cnst(string_n, &[]);
+    let list0 = st.cnst(list_n, &[st.zero]);
+    let list_char = st.app(list0, char_c);
+    let of_nat_ty = st.mk(Node::Pi(nat_c, char_c));
+    let mk_ty = st.mk(Node::Pi(list_char, string_c));
+    if !of_nat.lparams.is_empty() || of_nat.ty != of_nat_ty || !matches!(of_nat.kind, Kind::Def { .. }) {
+        return;
+    }
+    let mk_ok = match mk.kind {
+        Kind::Def { .. } => true,
+        Kind::Ctor { induct, num_params: 0, num_fields: 1, .. } => induct == string_n,
+        _ => false,
+    };
+    if !mk.lparams.is_empty() || mk.ty != mk_ty || !mk_ok {
+        return;
+    }
+    let b = &mut kenv.builtins;
+    (b.string, b.string_mk, b.char, b.char_of_nat, b.list_nil, b.list_cons) =
+        (cand.string, cand.string_mk, cand.char, cand.char_of_nat, cand.list_nil, cand.list_cons);
 }
 
 fn join(pre: &str, s: &str) -> String {
