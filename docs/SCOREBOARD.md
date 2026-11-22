@@ -13,7 +13,7 @@ Status key: ⬜ not started · 🟨 started · 🟩 measured win · ➖ out of s
 | 3 | Rebuild after one edit | Seconds | Isabelle, Lean | Re-elaborates everything downstream | < 1 s | ⬜ Phase 3 |
 | 4 | Re-check unchanged project | Seconds | Nobody | **18 s** wall re-checking the core library every run ([measured](../benchmarks/proof-bench)) | < 1 s (content-hash cache) | 🟨 hashing done: 6.5M nodes in 1.3 s |
 | 5 | Editor responsiveness | ms per edit | Isabelle | Good on small files, poor on large | < 50 ms | ➖ Phase 4 |
-| 6 | Parallel scaling | Speedup with cores | Nobody well | Limited by files and chains | Near-linear (per-declaration) | ⬜ next milestone |
+| 6 | Parallel scaling | Speedup with cores | Nobody well | Limited by files and chains | Near-linear (per-declaration) | 🟨 `certus check --jobs N`, same verdict for every N: 1,000 theorems in 70 ms on 8 threads vs 210 ms on 1 (nanoda 84 ms), 3.6× on the 28.9 MB automated round |
 | 7 | Memory | Peak RAM | Metamath | High | 10× below Lean | 🟨 whole core library in 0.5 GB |
 | 8 | Proof and cache size | Bytes | Metamath (50 MB text for set.mm) | Automated proofs 7× bigger than explicit ([measured](../benchmarks/proof-bench)) | Smaller than Lean's oleans | ⬜ |
 | 9 | Startup and imports | Time to first line | Metamath | 0.8–1.0 s for core Lean ([measured](../benchmarks/proof-bench)) | < 50 ms | ⬜ Phase 3 |

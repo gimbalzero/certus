@@ -1,6 +1,6 @@
 # The race: Certus vs Lean vs independent checkers
 
-The same theorem, **2 · (0 + 1 + … + n) = n(n + 1)**, checked by every system we could run, first with an explicit proof (rounds 1 and 2), then with an automated `simp`/`omega` proof (rounds 3 and 4). Rounds 1 and 2: Apple M2, 8 cores, Lean 4.36.0, best of 7 runs (2 for the slow Lean build), 21 Nov 2026.
+The same theorem, **2 · (0 + 1 + … + n) = n(n + 1)**, checked by every system we could run, first with an explicit proof (rounds 1 and 2), then with an automated `simp`/`omega` proof (rounds 3 and 4). Rounds 1 and 2: Apple M2, 8 cores, Lean 4.36.0, best of 7 runs (2 for the slow Lean build), 21 Nov 2026. The Certus rows are from a later run on the same machine with multi-core checking (`race.py --runs 5`, 22 Nov 2026). In that run nanoda took 5 ms and 84 ms.
 
 Every checker except "Lean, build from source" reads **the same certificate**: the theorems plus every declaration they depend on, all the way back to the definitions of `Nat` and `Eq`. Certus made it with `certus extract`. Nothing is trusted or skipped: each checker re-checks all of it.
 
@@ -8,8 +8,8 @@ Every checker except "Lean, build from source" reads **the same certificate**: t
 
 | Checker | Wall time | CPU time | What it checks |
 |---|---|---|---|
-| nanoda (Rust, 8 threads) | **8 ms** | 13 ms | all 83 declarations |
-| **Certus** (Rust, 1 thread) | **10 ms** | **9 ms** | all 83 declarations |
+| **Certus** (Rust, 8 threads) | **5 ms** | 11 ms | all 83 declarations |
+| nanoda (Rust, 8 threads) | 8 ms | 13 ms | all 83 declarations |
 | con-leche | 17 ms | 29 ms | all 83 declarations |
 | Lean, build from source | 297 ms | 307 ms | elaborates the file, kernel-checks 3 declarations, trusts the 80 imported ones |
 | Lean kernel replay (`leanchecker`) | 390 ms | 387 ms | re-checks the file's 3 declarations, trusts the imported ones |
@@ -20,8 +20,8 @@ Each copy has its own recursive definition, so this is 1,000 definitions and 1,0
 
 | Checker | Wall time | CPU time | vs Lean build |
 |---|---|---|---|
-| nanoda (8 threads) | **125 ms** | 602 ms | 45× faster |
-| **Certus** (1 thread) | **384 ms** | **382 ms** (least CPU) | **15× faster** |
+| **Certus** (8 threads) | **70 ms** | 373 ms | **81× faster** |
+| nanoda (8 threads) | 125 ms | 602 ms | 45× faster |
 | con-leche (8 threads) | 391 ms | 1,868 ms | 14× faster |
 | Lean kernel replay (`leanchecker`) | 1,210 ms | 1,205 ms | 4.7× faster |
 | Lean, build from source | 5,650 ms | 20,434 ms | 1× |
@@ -47,7 +47,7 @@ induction n with
 |---|---|---|---|---|
 | nanoda (4 threads) | **101 ms** | 247 ms | 57 ms | all 1,341 declarations |
 | con-leche (4 threads) | 152 ms | 487 ms | 1,068 ms | all 1,341 declarations |
-| **Certus** (1 thread) | **177 ms** | **176 ms** (least CPU) | 112 ms | all 1,341 declarations |
+| **Certus** (1 thread) | **177 ms** | **176 ms** (least CPU) | 60 ms (8 threads) | all 1,341 declarations |
 | Lean, build from source | 248 ms | 275 ms | 182 ms | elaborates `Sum.lean` (both proofs), trusts the imported `Lean.Omega` library |
 | Lean kernel replay (`leanchecker`) | 454 ms | 455 ms | 234 ms | re-checks `Sum.lean`'s own declarations, trusts the imported ones |
 
@@ -59,16 +59,18 @@ induction n with
 |---|---|---|---|---|
 | nanoda (4 threads) | **2,943 ms** | 10,765 ms | 1,121 ms | 9.5× faster |
 | con-leche (4 threads) | 3,509 ms | 13,807 ms | 3,274 ms | 8.0× faster |
-| **Certus** (1 thread) | **8,653 ms** | **8,653 ms** (least CPU) | 5,412 ms | **3.2× faster** |
+| **Certus** (1 thread) | **8,653 ms** | **8,653 ms** (least CPU) | 1,413 ms (8 threads) | **3.2× faster** |
 | Lean kernel replay (`leanchecker`) | 10,247 ms | 10,245 ms | 6,307 ms | 2.7× faster |
 | Lean, build from source | 27,993 ms | 66,761 ms | 9,039 ms | 1× |
+
+The Apple M2 column for Certus is a local run of `race.py --runs 5` with multi-core checking (8 threads), 22 Nov 2026. In that run nanoda took 1,114 ms on round 4 and 57 ms on round 3. With the kernel speed-ups of [#22](https://github.com/gimbalzero/certus/issues/22) as well, round 4 takes 0.83 s on 8 threads. The CI columns are still single-threaded Certus and will update on the next CI run.
 
 The CI run's explicit rounds, for comparison: round 1 Certus 8 ms, nanoda 6 ms, con-leche 15 ms, Lean build 247 ms; round 2 Certus 301 ms, nanoda 181 ms, con-leche 287 ms, `leanchecker` 1,220 ms, Lean build 10,054 ms, Metamath 6,390 ms.
 
 ## What it shows
 
 1. **Checking a certificate beats rebuilding by 15–45×**, for every independent checker. Most of Lean's build is searching for proofs, which the certificate makes unnecessary. That is the core claim of Certus, now measured end to end.
-2. **Certus does the least work.** It uses the least CPU of any checker: 382 ms against nanoda's 602 ms and con-leche's 1,868 ms. It is slower on the clock only because it runs on one core while nanoda uses eight. **Making Certus parallel is the next milestone**, and on CPU time alone it would then be the fastest.
+2. **Certus is now the fastest certificate checker on the clock.** Since `certus check --jobs N` (default: all cores, [#2](https://github.com/gimbalzero/certus/issues/2)), it checks round 2 in 70 ms on 8 threads against nanoda's 125 ms (84 ms in the same local run). On one thread it uses the least CPU of any checker (382 ms against nanoda's 602 ms and con-leche's 1,868 ms). The verdict is the same for every number of threads: each thread builds the full environment and type-checks the declarations it claims, so threads repeat some cheap work (converting terms, checking inductive types), and that costs CPU.
 3. **Certus only accepts what all three agree on.** nanoda and con-leche both accept the same certificates. Certus also rejects all seven tampered versions in its test suite: a wrong proof, a changed statement, a missing definition, a forged recursor, data posing as a theorem, an injected field, and a `partial` definition.
 4. **Lean's own checkers trust their imports.** `leanchecker` and the Lean build re-check only the file's own declarations and load the rest from `.olean` files. Certus re-checks everything the theorem depends on, and is still faster.
 5. **Automation narrows the gap but does not close it.** `simp` and `omega` find their proofs quickly, but the proofs they leave behind are large, so checking the certificate costs more. On 1,000 automated copies every certificate checker still beats the Lean build (3.2–9.5× in CI), and Certus still uses the least CPU (8.7 s against nanoda's 10.8 s and con-leche's 13.8 s). Here single-threading costs Certus the most: on the clock it is 3× behind nanoda.

@@ -8,7 +8,7 @@ Certus separates the two. **Search once, check forever.** The author's machine p
 
 The goal: **minutes on a laptop instead of days on a server**, and the best system on every one of the [44 axes](docs/SCOREBOARD.md) we track.
 
-> **Status: early Phase 1.** Certus has a working kernel: it type-checks Lean proofs from scratch, regenerates every recursor rather than trusting it, and beats Lean by 15–30× on our first benchmark. It supports nested inductive types; multi-core checking is next. See the [plan](docs/PLAN.md).
+> **Status: early Phase 1.** Certus has a working kernel: it type-checks Lean proofs from scratch, regenerates every recursor rather than trusting it, and beats Lean by 15–30× on our first benchmark. It supports nested inductive types and checks on all cores (`--jobs N`). See the [plan](docs/PLAN.md).
 
 ## The race
 
@@ -16,7 +16,8 @@ The same theorem, 2·(0+1+…+n) = n(n+1), checked from a certificate containing
 
 | | 1 theorem | 1,000 theorems |
 |---|---|---|
-| **Certus** (1 core) | **10 ms** | **384 ms** (least CPU of all) |
+| **Certus** (8 cores) | **5 ms** | **70 ms** |
+| Certus (1 core) | 10 ms | 210 ms (least CPU of all) |
 | nanoda (8 cores) | 8 ms | 125 ms |
 | con-leche (8 cores) | 17 ms | 391 ms |
 | Lean kernel replay (trusts imports) | 390 ms | 1,210 ms |
