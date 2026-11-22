@@ -5,151 +5,151 @@
   "seed": "12",
   "sample_size": "50",
   "runner": "ubuntu-latest, 4 vCPU, 16 GB",
-  "run": "https://github.com/gimbalzero/certus/actions/runs/44949174171"
+  "run": "https://github.com/gimbalzero/certus/actions/runs/44998000065"
  },
  "modules_sampled": 50,
  "modules_elaborated": 50,
- "profiled_total_s": 165.75609896999998,
+ "profiled_total_s": 149.7941749,
  "group_totals_s": {
-  "kernel": 8.32399,
-  "typeclass": 41.843202999999995,
-  "linting": 4.7930228,
-  "waiting": 14.26311,
-  "tactics": 23.35078662,
-  "interpretation": 21.0013,
-  "imports": 27.7536,
-  "compilation": 2.4034705,
-  "elaboration": 22.02361605
+  "kernel": 7.518529,
+  "typeclass": 28.699324,
+  "linting": 4.7224549,
+  "waiting": 17.63307,
+  "tactics": 21.64403026,
+  "interpretation": 19.965700000000002,
+  "imports": 27.4571,
+  "compilation": 2.6052128,
+  "elaboration": 19.54875394
  },
  "shares": {
   "kernel": {
    "n": 50,
-   "point": 0.050218302986887675,
-   "lo": 0.037666646042482245,
-   "hi": 0.0651648613994469
+   "point": 0.050192399037006875,
+   "lo": 0.0374058715558407,
+   "hi": 0.06250692005138299
   },
   "typeclass": {
    "n": 50,
-   "point": 0.25243839146801555,
-   "lo": 0.11159734894162925,
-   "hi": 0.3538511097102709
+   "point": 0.1915917225697139,
+   "lo": 0.11596046174523073,
+   "hi": 0.2614381692341302
   },
   "linting": {
    "n": 50,
-   "point": 0.028916117293925236,
-   "lo": 0.02438297826405159,
-   "hi": 0.03696551681631625
+   "point": 0.031526292014710376,
+   "lo": 0.02693814583439562,
+   "hi": 0.037238555333747564
   },
   "waiting": {
    "n": 50,
-   "point": 0.08604877943333754,
-   "lo": 0.04926378998417863,
-   "hi": 0.13991753789423933
+   "point": 0.11771532512376755,
+   "lo": 0.07284875431197317,
+   "hi": 0.17167038278340407
   },
   "tactics": {
    "n": 50,
-   "point": 0.1408743736435679,
-   "lo": 0.10650545823920685,
-   "hi": 0.18834751059980695
+   "point": 0.14449180199730183,
+   "lo": 0.11057893233673065,
+   "hi": 0.18133791879448127
   },
   "interpretation": {
    "n": 50,
-   "point": 0.12670001363751326,
-   "lo": 0.10783579826547963,
-   "hi": 0.1597163874580906
+   "point": 0.13328755950175472,
+   "lo": 0.1157874626704282,
+   "hi": 0.15786436335928344
   },
   "imports": {
    "n": 50,
-   "point": 0.16743637291453806,
-   "lo": 0.10710901651429326,
-   "hi": 0.2741529210943985
+   "point": 0.18329885002757873,
+   "lo": 0.13290930168243187,
+   "hi": 0.2573819168184269
   },
   "compilation": {
    "n": 50,
-   "point": 0.014500042622473886,
-   "lo": 0.010283831105008794,
-   "hi": 0.02156359992415028
+   "point": 0.017391949998984906,
+   "lo": 0.010615491166861507,
+   "hi": 0.026043494477368274
   },
   "elaboration": {
    "n": 50,
-   "point": 0.1328676059997408,
-   "lo": 0.08875992526961876,
-   "hi": 0.1638348522856115
+   "point": 0.13050409972918112,
+   "lo": 0.08695404078496473,
+   "hi": 0.16796914195227156
   }
  },
  "kernel_share_of_profile": {
   "n": 50,
-  "point": 0.050218302986887675,
-  "lo": 0.037666646042482245,
-  "hi": 0.0651648613994469
+  "point": 0.050192399037006875,
+  "lo": 0.0374058715558407,
+  "hi": 0.06250692005138299
  },
  "kernel_share_excl_imports": {
   "n": 50,
-  "point": 0.06031767585462007,
-  "lo": 0.04606157089740491,
-  "hi": 0.0807143421585765
+  "point": 0.061457485444586187,
+  "lo": 0.04704402227358936,
+  "hi": 0.07745484734733181
  },
  "kernel_share_of_cpu": {
   "n": 50,
-  "point": 0.05410915449469244,
-  "lo": 0.04095989685824794,
-  "hi": 0.07148728400851341
+  "point": 0.055923127845050734,
+  "lo": 0.04254490884101409,
+  "hi": 0.0695645049935126
  },
  "search_share": {
   "n": 50,
-  "point": 0.5200127787490967,
-  "lo": 0.4021312165204346,
-  "hi": 0.5918512623650969
+  "point": 0.4693710840687704,
+  "lo": 0.4063170793562759,
+  "hi": 0.5166554816583161
  },
- "elab_wall_s": 102.504,
- "elab_cpu_s": 153.837,
+ "elab_wall_s": 91.791,
+ "elab_cpu_s": 134.444,
  "replay_n": 50,
  "replay_only_vs_elab_wall": {
   "n": 50,
-  "point": 0.0591124346366971,
-  "lo": 0.042423674193597306,
-  "hi": 0.07943364579087986
+  "point": 0.058806723970759665,
+  "lo": 0.04325610322640589,
+  "hi": 0.07497726930603643
  },
  "replay_with_imports_vs_elab_wall": {
   "n": 50,
-  "point": 0.7253147974713181,
-  "lo": 0.489554895155634,
-  "hi": 1.102244463708724
+  "point": 0.822455687376758,
+  "lo": 0.6319891948008804,
+  "hi": 1.0820108911486852
  },
  "replay_only_vs_profiled_kernel": {
   "n": 50,
-  "point": 0.7279274722819224,
-  "lo": 0.6732869628510749,
-  "hi": 0.7968478533235545
+  "point": 0.7179500138923453,
+  "lo": 0.6673738661240447,
+  "hi": 0.7704584541146112
  },
  "nanoda": {
   "n": 49,
   "attempted": 49,
-  "wall_s": 86.255,
-  "cpu_s": 247.951,
-  "elab_wall_s_same_modules": 102.152,
+  "wall_s": 83.418,
+  "cpu_s": 241.154,
+  "elab_wall_s_same_modules": 91.389,
   "vs_elab_wall": {
    "n": 49,
-   "point": 0.8443789646800846,
-   "lo": 0.4542385683574458,
-   "hi": 1.4791762985917605
+   "point": 0.9127794373502283,
+   "lo": 0.5510025986114881,
+   "hi": 1.4003825920612147
   },
-  "median_wall_s": 0.754,
-  "max_rss_mb": 351.0
+  "median_wall_s": 0.558,
+  "max_rss_mb": 346.1
  },
  "leanchecker_closure": {
   "n": 49,
   "attempted": 49,
-  "wall_s": 383.278,
-  "cpu_s": 382.111,
-  "elab_wall_s_same_modules": 102.152,
+  "wall_s": 368.234,
+  "cpu_s": 366.94599999999997,
+  "elab_wall_s_same_modules": 91.389,
   "vs_elab_wall": {
    "n": 49,
-   "point": 3.752036181376772,
-   "lo": 1.9859760757896234,
-   "hi": 6.660263393780597
+   "point": 4.029303307837924,
+   "lo": 2.4030869064224634,
+   "hi": 6.265133392090206
   },
-  "median_wall_s": 2.907,
+  "median_wall_s": 2.506,
   "max_rss_mb": 554.7
  },
  "closure_decls": {
@@ -160,21 +160,11 @@
  },
  "certus": {
   "attempted": 49,
-  "accepted": 44,
-  "rejected": 5,
+  "accepted": 49,
+  "rejected": 0,
   "other_failure": 0,
-  "rejections": {
-   "String.toByteArray_empty: string literal needs String.mk, Char.ofNat, List.nil and List.cons": [
-    "Mathlib.Order.Category.Preord",
-    "Mathlib.Tactic.Linter.TextBased",
-    "Mathlib.Tactic.NormNum.DivMod",
-    "Mathlib.Util.DischargerAsTactic"
-   ],
-   "CategoryTheory.Presieve.map: inductive type: wrong number of indices": [
-    "Mathlib.AlgebraicGeometry.Morphisms.SurjectiveOnStalks"
-   ]
-  },
-  "accepted_wall_s": 172.759,
+  "rejections": {},
+  "accepted_wall_s": 201.427,
   "accepted_modules": [
    "Mathlib.Algebra.Algebra.Spectrum.Pi",
    "Mathlib.Algebra.Category.ModuleCat.Monoidal.Symmetric",
@@ -187,6 +177,7 @@
    "Mathlib.Algebra.SkewMonoidAlgebra.Lift",
    "Mathlib.Algebra.Star.NonUnitalSubalgebra",
    "Mathlib.AlgebraicGeometry.EllipticCurve.Projective.Formula",
+   "Mathlib.AlgebraicGeometry.Morphisms.SurjectiveOnStalks",
    "Mathlib.Analysis.Calculus.Deriv.Polynomial",
    "Mathlib.Analysis.Normed.Algebra.DualNumber",
    "Mathlib.Analysis.Normed.Operator.Fredholm.Open",
@@ -207,6 +198,7 @@
    "Mathlib.MeasureTheory.Integral.Gamma",
    "Mathlib.NumberTheory.Height.Northcott",
    "Mathlib.NumberTheory.NumberField.FiniteAdeleRing",
+   "Mathlib.Order.Category.Preord",
    "Mathlib.Order.Extension.Linear",
    "Mathlib.Probability.Decision.Risk.Defs",
    "Mathlib.Probability.Kernel.Defs",
@@ -216,10 +208,13 @@
    "Mathlib.RingTheory.Polynomial.Cyclotomic.Eval",
    "Mathlib.RingTheory.PowerSeries.WellKnown",
    "Mathlib.Tactic.Hessenberg.Reduce",
+   "Mathlib.Tactic.Linter.TextBased",
+   "Mathlib.Tactic.NormNum.DivMod",
    "Mathlib.Tactic.SudoSetOption",
    "Mathlib.Topology.DerivedSet",
    "Mathlib.Topology.Hom.Open",
-   "Mathlib.Topology.MetricSpace.CantorScheme"
+   "Mathlib.Topology.MetricSpace.CantorScheme",
+   "Mathlib.Util.DischargerAsTactic"
   ],
   "closures_with_nested_inductives": 46,
   "closures_scanned": 49
