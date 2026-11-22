@@ -15,3 +15,6 @@ path = "src/main.rs"
 blake3.workspace = true
 certus-core = { path = "../certus-core" }
 certus-kernel = { path = "../certus-kernel" }
+
+[dev-dependencies]
+serde_json.workspace = true
