@@ -1,10 +1,20 @@
 //! Reader for the `lean4export` NDJSON format, version 3.x.
 //!
 //! Each line is one JSON record. Names, universe levels and expressions get
-//! dense numeric ids (`in`, `il`, `ie`), and records may refer only to ids that
+//! numeric ids (`in`, `il`, `ie`), and records may refer only to ids that
 //! were defined earlier, so the file is a topologically ordered DAG. The
-//! reader *fails closed*: unknown record kinds, unknown fields, forward
-//! references, gaps in ids and duplicate declarations are all errors.
+//! reader *fails closed*: unknown record kinds, unknown fields, references
+//! to ids not yet defined, ids defined twice and duplicate declarations are
+//! all errors. Because every reference must point backwards, the graph can
+//! never contain a cycle.
+//!
+//! lean4export numbers each kind densely from 0 (`in` 0 is the anonymous
+//! name and `il` 0 is level zero, both implicit), but the format only asks
+//! for integer ids, and Lean's own importer accepts sparse or out-of-order
+//! ids as long as each is defined before use. The reader therefore maps the
+//! file's ids to dense internal ids ([`IdMap`]); for ordinary exports the
+//! map is the identity and costs nothing. All ids stored in [`Env`] are the
+//! internal ones.
 //!
 //! Names are canonicalised by content while reading, so two name records with
 //! the same text map to one id. That way, dependency analysis can never miss
@@ -522,8 +532,54 @@ pub struct Env {
     pub lines: u64,
 }
 
+/// Maps the ids a file uses for one kind of record to dense internal ids,
+/// in order of definition. While the file's ids are exactly `0, 1, 2, ...`
+/// the map is the identity and no table is kept.
+#[derive(Default)]
+struct IdMap {
+    sparse: Option<HashMap<u32, u32>>,
+}
+
+impl IdMap {
+    /// Define file id `id` as internal id `next` (the number of entries so
+    /// far). Fails if `id` was already defined.
+    fn define(&mut self, kind: &str, id: u32, next: usize) -> Result<u32, String> {
+        let next32 = u32::try_from(next).map_err(|_| format!("too many {kind} records"))?;
+        let dup = || format!("{kind} id {id} defined twice");
+        match &mut self.sparse {
+            None if id as usize == next => Ok(next32),
+            None if (id as usize) < next => Err(dup()),
+            None => {
+                let mut m: HashMap<u32, u32> = (0..next32).map(|i| (i, i)).collect();
+                m.insert(id, next32);
+                self.sparse = Some(m);
+                Ok(next32)
+            }
+            Some(m) => match m.entry(id) {
+                std::collections::hash_map::Entry::Occupied(_) => Err(dup()),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(next32);
+                    Ok(next32)
+                }
+            },
+        }
+    }
+
+    /// The internal id of file id `id`, if it has been defined (`len` is the
+    /// number of entries so far).
+    fn get(&self, id: u32, len: usize) -> Option<u32> {
+        match &self.sparse {
+            None => ((id as usize) < len).then_some(id),
+            Some(m) => m.get(&id).copied(),
+        }
+    }
+}
+
 struct Builder {
     meta: Option<Meta>,
+    name_ids: IdMap,
+    level_ids: IdMap,
+    expr_ids: IdMap,
     names: Vec<Name>,
     name_canon: Vec<NameId>,
     name_index: HashMap<NameKey, NameId>,
@@ -537,6 +593,9 @@ struct Builder {
 pub fn parse<R: BufRead>(mut reader: R) -> Result<Env, ParseError> {
     let mut b = Builder {
         meta: None,
+        name_ids: IdMap::default(),
+        level_ids: IdMap::default(),
+        expr_ids: IdMap::default(),
         names: vec![Name::Anon],
         name_canon: vec![0],
         name_index: HashMap::new(),
@@ -577,21 +636,20 @@ pub fn parse<R: BufRead>(mut reader: R) -> Result<Env, ParseError> {
     })
 }
 
-fn expect_id(kind: &str, got: u32, next: usize) -> Result<(), String> {
-    if got as usize == next { Ok(()) } else { Err(format!("{kind} id {got} out of sequence (expected {next})")) }
-}
-
 impl Builder {
     fn name(&self, id: NameId) -> Result<NameId, String> {
-        self.name_canon.get(id as usize).copied().ok_or_else(|| format!("reference to undefined name {id}"))
+        match self.name_ids.get(id, self.names.len()) {
+            Some(i) => Ok(self.name_canon[i as usize]),
+            None => Err(format!("reference to undefined name {id}")),
+        }
     }
 
     fn level(&self, id: LevelId) -> Result<LevelId, String> {
-        if (id as usize) < self.levels.len() { Ok(id) } else { Err(format!("reference to undefined level {id}")) }
+        self.level_ids.get(id, self.levels.len()).ok_or_else(|| format!("reference to undefined level {id}"))
     }
 
     fn expr(&self, id: ExprId) -> Result<ExprId, String> {
-        if (id as usize) < self.exprs.len() { Ok(id) } else { Err(format!("reference to undefined expression {id}")) }
+        self.expr_ids.get(id, self.exprs.len()).ok_or_else(|| format!("reference to undefined expression {id}"))
     }
 
     fn add(&mut self, r: Line, first: bool) -> Result<(), String> {
@@ -674,7 +732,6 @@ impl Builder {
         }
 
         if let Some(id) = in_id {
-            expect_id("name", id, self.names.len())?;
             let (name, key) = if let Some(s) = str {
                 let pre = self.name(s.pre)?;
                 (Name::Str { pre, s: s.str.clone() }, NameKey::Str(pre, s.str))
@@ -683,6 +740,7 @@ impl Builder {
                 let pre = self.name(n.pre)?;
                 (Name::Num { pre, n: n.i }, NameKey::Num(pre, n.i))
             };
+            let id = self.name_ids.define("name", id, self.names.len())?;
             let canon = *self.name_index.entry(key).or_insert(id);
             self.names.push(name);
             self.name_canon.push(canon);
@@ -690,7 +748,6 @@ impl Builder {
         }
 
         if let Some(id) = il {
-            expect_id("level", id, self.levels.len())?;
             let lvl = if let Some(a) = succ {
                 Level::Succ(self.level(a)?)
             } else if let Some([a, b]) = max {
@@ -700,12 +757,12 @@ impl Builder {
             } else {
                 Level::Param(self.name(param.expect("checked above"))?)
             };
+            self.level_ids.define("level", id, self.levels.len())?;
             self.levels.push(lvl);
             return Ok(());
         }
 
         if let Some(id) = ie {
-            expect_id("expression", id, self.exprs.len())?;
             let e = if let Some(i) = bvar {
                 Expr::BVar(i)
             } else if let Some(l) = sort {
@@ -749,6 +806,7 @@ impl Builder {
             } else {
                 Expr::StrLit(str_val.expect("checked above").into_boxed_str())
             };
+            self.expr_ids.define("expression", id, self.exprs.len())?;
             self.exprs.push(e);
             return Ok(());
         }
@@ -769,6 +827,10 @@ impl Builder {
         d.map_names(&mut |n| self.name(n))?;
         for e in d.roots() {
             self.expr(e)?;
+        }
+        if self.expr_ids.sparse.is_some() {
+            // Every root resolves (checked just above).
+            d.map_exprs(&mut |e| self.expr_ids.get(e, self.exprs.len()).expect("checked above"));
         }
         let idx = self.decls.len();
         for n in d.defined_names() {

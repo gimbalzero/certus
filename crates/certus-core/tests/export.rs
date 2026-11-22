@@ -142,10 +142,81 @@ fn rejects_forward_reference() {
     assert!(err_of(&bad).contains("undefined name 9"));
 }
 
+const META: &str = r#"{"meta":{"exporter":{"name":"handcrafted","version":"0.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"0000000000000000000000000000000000000000","version":"4.29.1"}}}"#;
+
+fn with_meta(lines: &[&str]) -> String {
+    let mut s = format!("{META}\n");
+    for l in lines {
+        s.push_str(l);
+        s.push('\n');
+    }
+    s
+}
+
 #[test]
-fn rejects_out_of_order_ids() {
+fn accepts_sparse_ids() {
+    // Arena `other/sparse-name-index`.
+    let env = env_of(&with_meta(&[
+        r#"{"in":2,"str":{"pre":0,"str":"foo"}}"#,
+        r#"{"ie":4,"sort":0}"#,
+        r#"{"axiom":{"isUnsafe":false,"levelParams":[],"name":2,"type":4}}"#,
+    ]));
+    assert_eq!(env.find_decl("foo"), Some(0));
+    assert_eq!(env.names.len(), 2);
+    assert_eq!(env.exprs.len(), 1);
+    // Declarations refer to the internal (dense) ids.
+    assert_eq!(env.decls[0].roots(), [0]);
+}
+
+#[test]
+fn accepts_out_of_order_ids() {
+    // Arena `other/level-index-out-of-order`: level 1 = succ (level 2) = succ (succ zero).
+    let env = env_of(&with_meta(&[
+        r#"{"in":1,"str":{"pre":0,"str":"foo"}}"#,
+        r#"{"il":2,"succ":0}"#,
+        r#"{"il":1,"succ":2}"#,
+        r#"{"ie":0,"sort":1}"#,
+        r#"{"axiom":{"isUnsafe":false,"levelParams":[],"name":1,"type":0}}"#,
+    ]));
+    use certus_core::export::{Expr, Level};
+    let Expr::Sort(l) = env.exprs[0] else { panic!("expected a sort") };
+    let Level::Succ(inner) = env.levels[l as usize] else { panic!("expected succ") };
+    assert_eq!(env.levels[inner as usize], Level::Succ(0));
+    // Reordering the ids of an ordinary export changes nothing but the ids.
+    let shuffled = TINY.replace("{\"in\":2,", "{\"in\":7,").replace("\"name\":2,", "\"name\":7,");
+    assert_eq!(hash::hash_env(&env_of(&shuffled)).root, hash::hash_env(&env_of(TINY)).root);
+}
+
+#[test]
+fn rejects_ids_never_defined() {
     let bad = TINY.replace("{\"in\":2,", "{\"in\":7,");
-    assert!(err_of(&bad).contains("out of sequence"));
+    assert!(err_of(&bad).contains("undefined name 2"));
+    let bad = with_meta(&[r#"{"il":1,"succ":2}"#, r#"{"il":2,"succ":0}"#]);
+    assert!(err_of(&bad).contains("undefined level 2"));
+    let bad = with_meta(&[r#"{"ie":3,"app":{"fn":5,"arg":5}}"#, r#"{"ie":5,"sort":0}"#]);
+    assert!(err_of(&bad).contains("undefined expression 5"));
+}
+
+#[test]
+fn rejects_self_reference() {
+    // A record may not refer to its own id, so no cycle can be built.
+    assert!(err_of(&with_meta(&[r#"{"in":3,"str":{"pre":3,"str":"x"}}"#])).contains("undefined name 3"));
+    assert!(err_of(&with_meta(&[r#"{"il":4,"succ":4}"#])).contains("undefined level 4"));
+    assert!(err_of(&with_meta(&[r#"{"ie":9,"app":{"fn":9,"arg":9}}"#])).contains("undefined expression 9"));
+}
+
+#[test]
+fn rejects_duplicate_ids() {
+    for lines in [
+        [r#"{"in":3,"str":{"pre":0,"str":"x"}}"#, r#"{"in":3,"str":{"pre":0,"str":"y"}}"#],
+        [r#"{"in":0,"str":{"pre":0,"str":"x"}}"#, r#"{"in":1,"str":{"pre":0,"str":"y"}}"#],
+        [r#"{"il":5,"succ":0}"#, r#"{"il":5,"succ":0}"#],
+        [r#"{"il":1,"succ":0}"#, r#"{"il":0,"succ":0}"#],
+        [r#"{"ie":7,"sort":0}"#, r#"{"ie":7,"sort":0}"#],
+        [r#"{"ie":0,"sort":0}"#, r#"{"ie":0,"sort":0}"#],
+    ] {
+        assert!(err_of(&with_meta(&lines)).contains("defined twice"), "{lines:?}");
+    }
 }
 
 #[test]
