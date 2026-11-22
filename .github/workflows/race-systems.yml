@@ -1,0 +1,134 @@
+name: Race (other provers)
+
+# The same theorem, 2 * (0 + 1 + ... + n) = n(n + 1), in Rocq, Agda, Isabelle
+# and HOL Light: one copy and 1,000 copies, timed by benchmarks/race/systems.py.
+# Each prover needs GBs of disk, so this runs here and not on a laptop.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - benchmarks/race/**
+      - .github/workflows/race-systems.yml
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash   # -eo pipefail, so `| tee` does not hide a failure
+
+concurrency:
+  group: race-systems-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rocq:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: rocq/rocq-prover:9.3.0
+      options: --user root
+    steps:
+      - uses: actions/checkout@v5
+      - name: Rocq on PATH
+        run: |
+          command -v python3 || (apt-get update -qq && apt-get install -y -qq python3)
+          bin="$(ls -d /home/*/.opam/*/bin | head -1)"
+          echo "$bin" >> "$GITHUB_PATH"
+          ls "$bin"
+          "$bin/rocq" --version
+          ls "$("$bin/rocq" c -where)/user-contrib"
+      - run: python3 benchmarks/race/systems.py rocq --runs 3 --json rocq.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with: {name: race-rocq, path: rocq.json}
+
+  agda:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AGDA_VERSION: v2.9.0
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Agda (release binary)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/agda"
+          curl -sSfL "https://github.com/agda/agda/releases/download/$AGDA_VERSION/Agda-$AGDA_VERSION-linux.tar.xz" \
+            | tar -xJf - -C "$HOME/agda"
+          find "$HOME/agda" -maxdepth 3 | head -20
+          bin="$(dirname "$(find "$HOME/agda" -type f -name agda | head -1)")"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/agda" --version
+      - run: python3 benchmarks/race/systems.py agda --runs 3 --json agda.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with: {name: race-agda, path: agda.json}
+
+  isabelle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ISABELLE_VERSION: Isabelle2026
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Isabelle (release bundle)
+        run: |
+          set -euo pipefail
+          # The /dist/ link redirects to a plain-HTTP host that runners cannot reach.
+          curl -sSfL --retry 3 \
+            "https://isabelle.in.tum.de/website-${ISABELLE_VERSION}/dist/${ISABELLE_VERSION}_linux.tar.gz" \
+            | tar -xzf - -C "$HOME"
+          echo "$HOME/$ISABELLE_VERSION/bin" >> "$GITHUB_PATH"
+          "$HOME/$ISABELLE_VERSION/bin/isabelle" version
+      - name: HOL heap (shipped with the bundle; built here if not)
+        run: isabelle build -b HOL
+      - run: python3 benchmarks/race/systems.py isabelle --runs 3 --json isabelle.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with: {name: race-isabelle, path: isabelle.json}
+
+  hol-light:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HOL_LIGHT_REV: 1a0c0e6b182cd9e271946ba8d78f7942619f4acb
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "4.14"
+      - name: Build HOL Light
+        run: |
+          set -euo pipefail
+          # setup-ocaml made a local switch in the workspace; use it from anywhere.
+          echo "OPAMSWITCH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          export OPAMSWITCH="$GITHUB_WORKSPACE"
+          git clone -q https://github.com/jrh13/hol-light "$HOME/hol-light"
+          cd "$HOME/hol-light"
+          git checkout -q "$HOL_LIGHT_REV"
+          opam install -y . --deps-only
+          opam exec -- make
+          echo "HOL_LIGHT_DIR=$HOME/hol-light" >> "$GITHUB_ENV"
+      - run: opam exec -- python3 benchmarks/race/systems.py hol-light --runs 1 --json hol-light.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with: {name: race-hol-light, path: hol-light.json}
+
+  table:
+    needs: [rocq, agda, isabelle, hol-light]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with: {pattern: race-*, merge-multiple: true, path: results}
+      - name: Results table
+        run: |
+          ls results
+          python3 benchmarks/race/systems.py --table results/*.json | tee table.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: race-systems-results
+          path: |
+            results/*.json
+            table.md

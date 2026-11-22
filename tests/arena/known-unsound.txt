@@ -1,4 +1,3 @@
 # Arena tests that Certus wrongly accepts and that already have a soundness issue.
 # Format: <test name> <issue>. Each one is still reported in every run. Once it is
 # rejected, the arena job fails until its line is deleted here.
-bugs/proj-of-subst-prop https://github.com/gimbalzero/certus/issues/17
