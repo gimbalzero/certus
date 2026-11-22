@@ -268,3 +268,17 @@ fn alpha_hash_does_not_depend_on_export_order() {
         assert_eq!(decl_hash(ORDER_12, name, true), decl_hash(ORDER_21, name, true), "{name} alpha");
     }
 }
+
+#[test]
+fn lazy_hashes_match_full_hashes() {
+    for src in [TINY, ALPHA, ORDER_12] {
+        let env = env_of(src);
+        for mode in [hash::Mode::Faithful, hash::Mode::AlphaNormal] {
+            let full = hash::hash_env_with(&env, mode);
+            let mut lazy = hash::LazyHashes::new(&env, mode);
+            for i in (0..env.decls.len()).rev() {
+                assert_eq!(lazy.decl(i), full.decls[i]);
+            }
+        }
+    }
+}

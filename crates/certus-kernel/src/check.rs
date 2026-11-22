@@ -7,6 +7,7 @@ use crate::quot::check_quot;
 use crate::tc::{KError, R, STACK_SIZE, TC};
 use crate::term::{E, L, Level, Node, Store};
 use certus_core::export::{self as ex, Decl, Env, NameId};
+use certus_core::{deps, hash};
 use num_bigint::BigUint;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -184,6 +185,7 @@ fn check_on_this_thread(env: &Env, decls: &[usize]) -> Result<Report, CheckError
 
     let mut conv = Conv { ex: env, exprs: vec![None; env.exprs.len()], levels: vec![None; env.levels.len()] };
     let mut counts: FxHashMap<&'static str, usize> = FxHashMap::default();
+    let mut hashes: Option<hash::LazyHashes> = None;
     let mut times: Vec<(usize, Duration)> = Vec::new();
 
     for &i in decls {
@@ -198,7 +200,7 @@ fn check_on_this_thread(env: &Env, decls: &[usize]) -> Result<Report, CheckError
             }
         }
         for n in added {
-            activate_nat(&mut st, &mut kenv, &candidates, n, &strs);
+            activate_nat(&mut st, &mut kenv, &candidates, n, &strs, env, &mut hashes);
             activate_string(&mut st, &mut kenv, &candidates, n);
         }
         *counts.entry(d.kind()).or_default() += 1;
@@ -218,28 +220,97 @@ fn check_on_this_thread(env: &Env, decls: &[usize]) -> Result<Report, CheckError
     })
 }
 
-/// Fingerprints of the genuine definitions (type and value) of the `Nat`
-/// operations the kernel computes natively, as exported by Lean 4.36.
-/// A definition with any other fingerprint is checked by plain unfolding.
-const GENUINE_NAT_OPS: &[(&str, &str)] = &[
-    ("Nat.add", "c68c7439421c1283ba8c14ab743cc505364d05085debacf408613fd4503c68e6"),
-    ("Nat.sub", "a7d8706199deff5e03df340f359c8ee81c32934cf077e60ddeebecff5e340bb5"),
-    ("Nat.mul", "86c7588a6d697790d91d4e14871e4c6db69ddd7e8e30e0db28916787c593be47"),
-    ("Nat.div", "e1c5b205a36cbe96e5ea5ffea352639d5b6f90d2b065773da7d1fcd4e68736eb"),
-    ("Nat.mod", "b2b31b3348dc57e5959961d5b0c78d4ca93775966d3828f7be723e8a61d66bb6"),
-    ("Nat.gcd", "ff6bfed41eee27a12b5f0152b8c5ef08849ecd3258a80746141021709d1046a2"),
-    ("Nat.beq", "d95a94a6f826e8e39cb1ed5ac185226b6dd7329a9ea66680826814d3ca173fdf"),
-    ("Nat.ble", "df488cf053ffc6a5312f8d5e2cfb73aabbdf1ac65e785c7e608104b080f41116"),
-    ("Nat.land", "9702e161e31b7a814cb8d557c08f74171627e25089c3fe89d435e3f2d905abc1"),
-    ("Nat.lor", "034c52eb295749a016a7e0800541ad1f076dfcbb057cde9f70703d79a896493b"),
-    ("Nat.xor", "92f61f733666d5039cad909dd9153f97f0a060d5b2edfdddfba972c773fd4d94"),
-    ("Nat.shiftLeft", "330a5645b7295feb9495421985d7ffb6c446c44bd0e3a7283ee0f36a173c0b98"),
-    ("Nat.shiftRight", "9f80dec2f26c52f6928b2b119e2919d94e08de0a1a7b6e3c5fd4143fcedc069d"),
-    ("Nat.pow", "993d5719ad127a229165d370790118f80d020f7dce2de97e0af3a9d81249af12"),
-    ("Nat.log2", "a55606bcd21cb68a9965bd1049a165d831b7a0fc5137438b3fe35f073cb0f597"),
+/// Fingerprints of the genuine `Nat` operations the kernel computes natively,
+/// one table per supported Lean release (see [`closure_fingerprint`]).
+///
+/// Soundness: a fingerprint covers the operation's definition *and* its whole
+/// dependency closure (every constant its type or value mentions,
+/// transitively, by content), so a match means the export contains exactly
+/// Lean's own definitions of the operation, of `Nat`, `Bool` and of every
+/// helper (`Nat.add.match_1`, `Nat.brecOn`, `WellFounded.fix`, ...). Those
+/// definitions compute what the native code computes, so native evaluation
+/// cannot prove anything plain unfolding would not. Anything else, including
+/// a release not listed here, is checked by plain unfolding: slower, never
+/// unsound.
+///
+/// To add a release, check one of its exports that uses the operations
+/// (e.g. the Arena's `init-prelude`) with `CERTUS_PRINT_FINGERPRINTS=1` and
+/// paste the printed lines here.
+const GENUINE_NAT_OPS: &[(&str, &[(&str, &str)])] = &[
+    // From the Arena round 2026-09 exports (`init-prelude`, `grind-ring-5`,
+    // `magma-list-deep-n21`). The other operations appear in none of them, so
+    // in 4.29 exports they are unfolded until someone pins them.
+    (
+        "4.29.1",
+        &[
+            ("Nat.add", "5a7c173a0ef55a6c20c18f4134cf8a044b2a498a7e87a05991972ac8ab65bfe2"),
+            ("Nat.sub", "286103e79ab8e57b87e2cd94aa561643bf34680024e58ea45730913556f621f9"),
+            ("Nat.mul", "9f47cfc0e7e12a16d63fe1c1ef0fe0e7f413a17edda9737a4138936553e3c222"),
+            ("Nat.div", "6c3e73937c8ab8efb3235a0c007f4d49cdd755a9fda8f1e57761451e43eb145d"),
+            ("Nat.mod", "b0c74bc7b02fd6d7d8b089ddb38164a2990c922ae85af49f5ca02c2fdcbba87a"),
+            ("Nat.beq", "ed417e90b6a77a347d879d605ef9416a712d29f4ed22fed691ee7df6b3ca5ce0"),
+            ("Nat.ble", "23583a3f40d1206cdf8badda9c992906d382326be53fcff7fdec35ff5cbba93a"),
+            ("Nat.land", "a8ac2d209146e080e190045b3a7e411c3f224034a592d02160d42b12afbbd4d9"),
+            ("Nat.shiftRight", "70549bca8ad52a720ed98eb067acd50c6e83ac883d8e80cf951e8314eecbaad6"),
+            ("Nat.pow", "c594a43937f7c2b1b392748209c03145c56b9cb3d53dc75767690b9445bcc826"),
+        ],
+    ),
+    // From `leanexport` of `theorem t : Nat.<op> .. = .. := rfl` for every
+    // operation (identical in the Arena live exports and `sum_explicit.cert`).
+    (
+        "4.36.0",
+        &[
+            ("Nat.add", "f8ef476856ad3603f71be6defdc47a8fe84e89168f558ab70ab10fbd47fa6196"),
+            ("Nat.sub", "ffcb51b009dbf289d364bb885865c42daed866f79bb9330fb387998506ab84ed"),
+            ("Nat.mul", "ad719d942f5cbd7b67f78c701a84cf8d26fb3dea917f592abe6a53528b13c09d"),
+            ("Nat.div", "e5da2ba5bb0e1a6990e0dfe92606fc4f77203f59cbc91f385f266ee484cd539b"),
+            ("Nat.mod", "0d9f53827d8b945045310354688bd368fc7d9f204cb6c619dd7f8e0acdfc0498"),
+            ("Nat.gcd", "1fa7a7606ed99e6bda63f82d01f4843efea5175f17c0820b59272d6068b990f1"),
+            ("Nat.beq", "6fe74250c23139bd43e4804a7bb4fbcf042accb06252329683c33e37e6fb2db4"),
+            ("Nat.ble", "100b9da55221cb1691f37b545928402dc81d629c049b65176de2e0a89116d508"),
+            ("Nat.land", "30370380f3846328114b4fed245068a8a9264becefafa6e2de57bf9c9cde9bbf"),
+            ("Nat.lor", "8a8aff47600abd699279e4dd00afee5fb36ba8f3b1372d23b679a1f57afcffe4"),
+            ("Nat.xor", "dc02a85b47b89d8aaf7802826541575f9da98c987f7dffa00f2cf6a96f1b922a"),
+            ("Nat.shiftLeft", "5fb4c94d70a84775689546fc75340265c0e8bfcafc77d8e295ad3fdb6d152f52"),
+            ("Nat.shiftRight", "92c75d99ad7940a20744a0cf22467dda16d156eb685ca172d892a73cb51dfe40"),
+            ("Nat.pow", "11c1ab2525a089ebb908656fefe5916dfbf38390bcd040231abf2ab3c1a3a700"),
+            ("Nat.log2", "1980f5a8b660285ca3cddaab6ddfe9b7c9d332e31749e76cbdb33025b188f3d2"),
+        ],
+    ),
 ];
 
-fn activate_nat(st: &mut Store, kenv: &mut KEnv, cand: &Builtins, n: NameId, strs: &[String]) {
+/// Domain separation for [`closure_fingerprint`].
+const CLOSURE_FP_CONTEXT: &str = "certus genuine Nat operation closure 2026-11-21";
+
+/// Fingerprint of declaration `decl` together with everything it depends on:
+/// the alpha-normal (spec v1) hashes of all declarations in its dependency
+/// closure, sorted, so the result depends neither on the export order nor on
+/// binder names, only on content. `None` if the closure is incomplete or
+/// contains anything unsafe or partial.
+fn closure_fingerprint(env: &Env, hashes: &mut hash::LazyHashes, decl: usize) -> Option<String> {
+    let c = deps::closure(env, &[decl]);
+    if !c.missing.is_empty() || !c.unsafe_or_partial.is_empty() {
+        return None;
+    }
+    let mut hs: Vec<hash::Hash> = c.decls.iter().map(|&j| hashes.decl(j)).collect();
+    hs.sort_unstable();
+    let mut h = blake3::Hasher::new_derive_key(CLOSURE_FP_CONTEXT);
+    h.update(&(hs.len() as u64).to_le_bytes());
+    for x in &hs {
+        h.update(x);
+    }
+    Some(hash::hex(h.finalize().as_bytes()))
+}
+
+fn activate_nat<'e>(
+    st: &mut Store,
+    kenv: &mut KEnv,
+    cand: &Builtins,
+    n: NameId,
+    strs: &[String],
+    env: &'e Env,
+    hashes: &mut Option<hash::LazyHashes<'e>>,
+) {
     let get = |kenv: &KEnv, n: Option<NameId>| n.and_then(|n| kenv.get(n));
     if Some(n) == cand.nat {
         // `Nat : Type` with exactly `zero : Nat` and `succ : Nat → Nat`.
@@ -265,19 +336,18 @@ fn activate_nat(st: &mut Store, kenv: &mut KEnv, cand: &Builtins, n: NameId, str
         return;
     }
     let Some(&(_, op)) = cand.nat_ops.iter().find(|(m, _)| *m == n) else { return };
-    if kenv.builtins.nat.is_none() {
+    if kenv.builtins.nat.is_none() || !matches!(kenv.get(n).map(|c| c.kind.clone()), Some(Kind::Def { .. })) {
         return;
     }
-    let Some(c) = kenv.get(n) else { return };
-    let Kind::Def { val, .. } = c.kind else { return };
-    let name = |i: NameId| strs[i as usize].clone();
-    let mut h = blake3::Hasher::new();
-    h.update(&st.fingerprint(c.ty, &name)).update(&st.fingerprint(val, &name));
-    let fp: String = h.finalize().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let Some(&decl) = env.decl_of_name.get(&n) else { return };
+    let hashes = hashes.get_or_insert_with(|| hash::LazyHashes::new(env, hash::Mode::AlphaNormal));
+    let Some(fp) = closure_fingerprint(env, hashes, decl) else { return };
+    let name = &strs[n as usize];
     if std::env::var_os("CERTUS_PRINT_FINGERPRINTS").is_some() {
-        eprintln!("(\"{}\", \"{fp}\"),", strs[n as usize]);
+        eprintln!("(\"{name}\", \"{fp}\"),");
     }
-    if GENUINE_NAT_OPS.iter().any(|(s, f)| *s == strs[n as usize] && *f == fp) {
+    let genuine = GENUINE_NAT_OPS.iter().flat_map(|(_, ops)| ops.iter()).any(|(s, f)| s == name && *f == fp);
+    if genuine {
         kenv.builtins.nat_ops.push((n, op));
     }
 }
