@@ -810,4 +810,16 @@ impl Env {
     pub fn find_decl(&self, printed: &str) -> Option<usize> {
         self.decl_of_name.iter().find(|(n, _)| self.name_str(**n) == printed).map(|(_, &i)| i)
     }
+
+    /// `find_decl` for several names at once, in a single pass.
+    pub fn find_decls(&self, printed: &[&str]) -> Vec<Option<usize>> {
+        let mut found = vec![None; printed.len()];
+        for (&n, &i) in &self.decl_of_name {
+            let s = self.name_str(n);
+            if let Some(k) = printed.iter().position(|p| *p == s) {
+                found[k] = Some(i);
+            }
+        }
+        found
+    }
 }

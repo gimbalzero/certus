@@ -28,6 +28,8 @@ USAGE:
     certus check <export.ndjson> [<Decl.Name>...]
         Type-check declarations with the Certus kernel. With names, check
         exactly what those declarations depend on; without, check everything.
+        Exit code 0: all accepted; 1: REJECTED (invalid) or other error;
+        2: DECLINED (ran out of work budget or stack before a verdict).
     certus extract <export.ndjson> <out.ndjson> <Decl.Name>...
         Write a minimal certificate: the named declarations plus everything
         they depend on, as a standalone export file.
@@ -47,7 +49,19 @@ fn main() -> ExitCode {
         Some("deps") if args.len() == 4 && args[3] == "--list" => deps_cmd(&args[1], &args[2], true),
         Some("show") if args.len() == 3 => show_cmd(&args[1], &args[2], false),
         Some("show") if args.len() == 4 && args[3] == "--raw" => show_cmd(&args[1], &args[2], true),
-        Some("check") if args.len() >= 2 => with_big_stack(move || check_cmd(&args[1], &args[2..])),
+        Some("check") if args.len() >= 2 => {
+            return match with_big_stack(move || check_cmd(&args[1], &args[2..])) {
+                Ok(Ok(())) => ExitCode::SUCCESS,
+                Ok(Err(declined)) => {
+                    eprintln!("error: {declined}");
+                    ExitCode::from(2)
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Some("extract") if args.len() >= 4 => extract_cmd(&args[1], &args[2], &args[3..]),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
@@ -217,7 +231,7 @@ fn show_cmd(path: &str, name: &str, raw: bool) -> Result<(), String> {
 }
 
 /// Deeply nested proof terms need a deep stack.
-fn with_big_stack(f: impl FnOnce() -> Result<(), String> + Send + 'static) -> Result<(), String> {
+fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
     std::thread::Builder::new()
         .stack_size(1 << 30)
         .spawn(f)
@@ -235,7 +249,9 @@ fn resolve(env: &Env, names: &[String]) -> Result<Vec<usize>, String> {
     names.iter().map(|n| index.get(n).copied().ok_or_else(|| format!("no declaration named {n}"))).collect()
 }
 
-fn check_cmd(path: &str, names: &[String]) -> Result<(), String> {
+/// `Err` is a failure (including `REJECTED`); `Ok(Err(_))` means the kernel
+/// declined: it ran out of resources before reaching a verdict.
+fn check_cmd(path: &str, names: &[String]) -> Result<Result<(), String>, String> {
     let env = load(path)?;
     let decls: Vec<usize> = if names.is_empty() {
         (0..env.decls.len()).collect()
@@ -243,14 +259,18 @@ fn check_cmd(path: &str, names: &[String]) -> Result<(), String> {
         let roots = resolve(&env, names)?;
         deps::closure(&env, &roots).decls
     };
-    let r = certus_kernel::check(&env, &decls).map_err(|e| format!("REJECTED {e}"))?;
+    let r = match certus_kernel::check(&env, &decls) {
+        Ok(r) => r,
+        Err(e) if e.resource => return Ok(Err(format!("DECLINED {e} (no verdict: out of resources)"))),
+        Err(e) => return Err(format!("REJECTED {e}")),
+    };
     let kinds: Vec<String> = r.by_kind.iter().map(|(k, n)| format!("{n} {k}")).collect();
     println!("OK: {} declarations type-checked in {:.3} s ({})", r.checked, r.time.as_secs_f64(), kinds.join(", "));
     println!("term nodes: {}; Nat operations verified for native arithmetic: {}", r.term_nodes, r.native_nat_ops);
     for (n, t) in &r.slowest {
         println!("  {:>9.3} ms  {n}", t.as_secs_f64() * 1e3);
     }
-    Ok(())
+    Ok(Ok(()))
 }
 
 fn extract_cmd(path: &str, out: &str, names: &[String]) -> Result<(), String> {

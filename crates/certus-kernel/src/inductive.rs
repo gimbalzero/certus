@@ -1052,7 +1052,8 @@ impl Checker<'_, '_> {
                 let d = self.tc.st.first_difference(ty, r.ty).unwrap_or_default();
                 return Err(format!(
                     "recursor type does not match the one generated from the inductive (generated vs exported: {d})"
-                ));
+                )
+                .into());
             }
             // Reduction rules.
             let mut rules = Vec::new();
@@ -1094,7 +1095,8 @@ impl Checker<'_, '_> {
                     let d = self.tc.st.first_difference(b.rhs, a.rhs).unwrap_or_default();
                     return Err(format!(
                         "recursor rules do not match the ones generated from the inductive (generated vs exported: {d})"
-                    ));
+                    )
+                    .into());
                 }
             }
             if r.num_params as usize != self.np
@@ -1156,7 +1158,8 @@ impl Checker<'_, '_> {
                 let d = self.tc.st.first_difference(ty, c.ty).unwrap_or_default();
                 return Err(format!(
                     "constructor type does not survive the translation back from the auxiliary block ({d})"
-                ));
+                )
+                .into());
             }
             let kind =
                 Kind::Ctor { induct: c.induct, cidx: c.cidx, num_params: c.num_params, num_fields: c.num_fields };

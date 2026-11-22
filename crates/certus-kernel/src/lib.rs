@@ -21,3 +21,4 @@ pub mod tc;
 pub mod term;
 
 pub use check::{CheckError, Report, check};
+pub use tc::KError;
