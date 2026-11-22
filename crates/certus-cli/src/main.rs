@@ -3,7 +3,7 @@
 use certus_core::{Env, deps, hash, parse, pretty};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -32,7 +32,8 @@ USAGE:
         for every N.
         Accepted declarations are remembered in a verdict cache, keyed on
         their content and everything they depend on, so an unchanged
-        declaration is not checked again (see docs/CACHE.md).
+        declaration is not checked again, and an export accepted before, byte
+        for byte, is not even parsed again (see docs/CACHE.md).
         --cache DIR: keep the cache in DIR (default: $XDG_CACHE_HOME/certus
         or ~/.cache/certus); --no-cache: neither read nor write it.
         Exit code 0: all accepted; 1: REJECTED (invalid) or other error;
@@ -99,6 +100,50 @@ fn load(path: &str) -> Result<Env, String> {
         env.lines as f64 / 1e6 / secs
     );
     Ok(env)
+}
+
+/// Like `load`, and also the BLAKE3 hash of exactly the bytes that were
+/// parsed (hashed as they are read, so a file that changes meanwhile cannot
+/// pair one content's hash with another's verdict).
+fn load_hashed(path: &str) -> Result<(Env, hash::Hash), String> {
+    let t = Instant::now();
+    let f = File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut r = BufReader::with_capacity(1 << 20, Tee { inner: f, h: blake3::Hasher::new() });
+    let env = parse(&mut r).map_err(|e| format!("{path}: {e}"))?;
+    // Hash whatever the parser did not need to read, too.
+    std::io::copy(&mut r, &mut std::io::sink()).map_err(|e| format!("{path}: {e}"))?;
+    let bytes = *r.into_inner().h.finalize().as_bytes();
+    let secs = t.elapsed().as_secs_f64();
+    eprintln!(
+        "parsed {} lines ({:.1} MB) in {:.2} s: {:.0} MB/s, {:.2}M records/s",
+        env.lines,
+        env.bytes as f64 / 1e6,
+        secs,
+        env.bytes as f64 / 1e6 / secs,
+        env.lines as f64 / 1e6 / secs
+    );
+    Ok((env, bytes))
+}
+
+/// A reader that hashes everything read through it.
+struct Tee<R> {
+    inner: R,
+    h: blake3::Hasher,
+}
+
+impl<R: Read> Read for Tee<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.h.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// BLAKE3 hash of a file's bytes.
+fn hash_file(path: &str) -> std::io::Result<hash::Hash> {
+    let mut h = blake3::Hasher::new();
+    h.update_reader(File::open(path)?)?;
+    Ok(*h.finalize().as_bytes())
 }
 
 fn timed_hash(env: &Env) -> hash::Hashes {
@@ -280,14 +325,32 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
         }
     }
     let names = &names[..];
-    let env = load(path)?;
+    let mut cache = cache_dir.and_then(VerdictCache::open);
+    if let Some(c) = &cache {
+        // An export accepted before, byte for byte, by this same build and for
+        // the same targets: nothing to parse or check.
+        let t = Instant::now();
+        if let Ok(bytes) = hash_file(path)
+            && c.known.contains(&certus_core::cache::export_key(&c.checker, &bytes, names))
+        {
+            println!(
+                "OK: export unchanged since this build accepted it (verdict cache, {:.3} s)",
+                t.elapsed().as_secs_f64()
+            );
+            return Ok(Ok(()));
+        }
+    }
+    let (env, bytes) = load_hashed(path)?;
     let decls: Vec<usize> = if names.is_empty() {
         (0..env.decls.len()).collect()
     } else {
         let roots = resolve(&env, names)?;
         deps::closure(&env, &roots).decls
     };
-    let cache = cache_dir.and_then(|dir| VerdictCache::open(dir, &env));
+    if let Some(c) = &mut cache {
+        c.keys = certus_core::cache::keys(&env, &c.checker);
+        c.export = Some(certus_core::cache::export_key(&c.checker, &bytes, names));
+    }
     let known: Vec<bool> = match &cache {
         Some(c) => decls.iter().map(|&i| c.is_known(i)).collect(),
         None => Vec::new(),
@@ -296,6 +359,11 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
         // Every declaration, inductive types included, was accepted before
         // with exactly this content and these dependencies.
         println!("OK: {} declarations type-checked (all known good from the verdict cache)", decls.len());
+        if let Some(c) = &cache
+            && let Err(e) = c.remember(&[])
+        {
+            eprintln!("warning: could not write the verdict cache: {e}");
+        }
         return Ok(Ok(()));
     }
     let r = match certus_kernel::check_with(&env, &decls, jobs, &known) {
@@ -341,31 +409,33 @@ fn default_cache_dir() -> Option<std::path::PathBuf> {
 /// mismatching lines are ignored: they can only cause a re-check.
 struct VerdictCache {
     file: std::path::PathBuf,
+    checker: hash::Hash,
+    /// Key of every declaration, and of the whole check (set once parsed).
     keys: Vec<Option<hash::Hash>>,
+    export: Option<hash::Hash>,
     known: HashSet<hash::Hash>,
 }
 
 impl VerdictCache {
-    fn open(dir: std::path::PathBuf, env: &Env) -> Option<Self> {
+    fn open(dir: std::path::PathBuf) -> Option<Self> {
         let file = dir.join("verdicts-v1.log");
-        let keys = certus_core::cache::keys(env, &checker_id()?);
+        let checker = checker_id()?;
         let known = std::fs::read_to_string(&file)
             .map(|s| s.lines().filter_map(certus_core::cache::parse_entry).collect())
             .unwrap_or_default();
-        Some(VerdictCache { file, keys, known })
+        Some(VerdictCache { file, checker, keys: Vec::new(), export: None, known })
     }
 
     fn is_known(&self, decl: usize) -> bool {
         self.keys[decl].is_some_and(|k| self.known.contains(&k))
     }
 
-    /// Record that every declaration in `decls` was accepted.
+    /// Record that every declaration in `decls` was accepted, and so was
+    /// the whole check.
     fn remember(&self, decls: &[usize]) -> std::io::Result<()> {
         let mut new = String::new();
-        for &i in decls {
-            if let Some(k) = &self.keys[i]
-                && !self.known.contains(k)
-            {
+        for k in decls.iter().filter_map(|&i| self.keys[i].as_ref()).chain(&self.export) {
+            if !self.known.contains(k) {
                 new.push_str(&certus_core::cache::entry(k));
                 new.push('\n');
             }
