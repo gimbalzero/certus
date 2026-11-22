@@ -37,7 +37,7 @@ Each copy has its own recursive definition, so this is 1,000 definitions and 1,0
 ## Not in the race (yet)
 
 - **The automated (`simp`/`omega`) proof.** It depends on `Lean.Syntax`, a *nested* inductive type, which Certus rejects for now rather than skipping. Nested inductives are the next kernel feature.
-- **Lean4Lean.** The binary we have was built for a different Lean version.
+- **Lean4Lean.** `race.yml` builds it from source against Lean 4.36, with `benchmarks/race/lean4lean/0001-lean-4.36.patch` for the API changes, and `race.py` runs it if it is on `PATH`. It does not build yet: its compile-time self-test rejects Lean 4.36's new `Nat.div` (and `Nat.bitwise`) definitions, and we will not loosen that check (#31).
 - **Rocq, Isabelle, Agda, HOL Light.** Each needs several GB to install, which this machine doesn't have free. They are planned for CI.
 - **Metamath on just this theorem.** set.mm's `arisum` depends on 4,594 earlier theorems. Verifying them one command at a time took 44 s, almost all of it command overhead, so the number would mislead. The whole-library time above is the fair Metamath figure.
 
