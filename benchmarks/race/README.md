@@ -1,6 +1,6 @@
 # The race: Certus vs Lean vs independent checkers
 
-The same theorem, **2 · (0 + 1 + … + n) = n(n + 1)**, checked by every system we could run. Apple M2, 8 cores, Lean 4.36.0, best of 7 runs (2 for the slow Lean build), 21 Nov 2026.
+The same theorem, **2 · (0 + 1 + … + n) = n(n + 1)**, checked by every system we could run, first with an explicit proof (rounds 1 and 2), then with an automated `simp`/`omega` proof (rounds 3 and 4). Rounds 1 and 2: Apple M2, 8 cores, Lean 4.36.0, best of 7 runs (2 for the slow Lean build), 21 Nov 2026.
 
 Every checker except "Lean, build from source" reads **the same certificate**: the theorems plus every declaration they depend on, all the way back to the definitions of `Nat` and `Eq`. Certus made it with `certus extract`. Nothing is trusted or skipped: each checker re-checks all of it.
 
@@ -27,12 +27,51 @@ Each copy has its own recursive definition, so this is 1,000 definitions and 1,0
 | Lean, build from source | 5,650 ms | 20,434 ms | 1× |
 | *Metamath, all of set.mm (48,388 theorems), for scale* | *8,647 ms* | *8,643 ms* | n/a |
 
+## Rounds 3 and 4: the automated proof
+
+The same theorem, proved by automation instead of named rewrites:
+
+```lean
+induction n with
+| zero => rfl
+| succ k ih =>
+  simp only [sumTo, Nat.mul_add, Nat.add_mul, Nat.mul_one, Nat.one_mul] at *
+  omega
+```
+
+`omega` builds its proof from Lean's own `Lean.Omega` library, so the certificate is much larger: it re-checks that library and everything under it, including the nested inductive `Lean.Syntax`. Measured on `ubuntu-latest` (4 cores) in CI, [run 44995719467](https://github.com/gimbalzero/certus/actions/runs/44995719467), 21 Nov 2026: best of 5 runs (2 for the 1,000-copy Lean build). The Apple M2 column is a local run, best of 7.
+
+### Round 3: one theorem, automated (1,341 declarations, 4.2 MB certificate)
+
+| Checker | Wall time | CPU time | Apple M2 wall | What it checks |
+|---|---|---|---|---|
+| nanoda (4 threads) | **101 ms** | 247 ms | 57 ms | all 1,341 declarations |
+| con-leche (4 threads) | 152 ms | 487 ms | 1,068 ms | all 1,341 declarations |
+| **Certus** (1 thread) | **177 ms** | **176 ms** (least CPU) | 112 ms | all 1,341 declarations |
+| Lean, build from source | 248 ms | 275 ms | 182 ms | elaborates `Sum.lean` (both proofs), trusts the imported `Lean.Omega` library |
+| Lean kernel replay (`leanchecker`) | 454 ms | 455 ms | 234 ms | re-checks `Sum.lean`'s own declarations, trusts the imported ones |
+
+`Sum.lean` holds both proofs, so the two Lean rows do the same work as in round 1. The con-leche time on the M2 is its best of 7 there; on the CI runner it was 152 ms.
+
+### Round 4: 1,000 automated theorems (5,337 declarations, 28.9 MB certificate)
+
+| Checker | Wall time | CPU time | Apple M2 wall | vs Lean build (CI) |
+|---|---|---|---|---|
+| nanoda (4 threads) | **2,943 ms** | 10,765 ms | 1,121 ms | 9.5× faster |
+| con-leche (4 threads) | 3,509 ms | 13,807 ms | 3,274 ms | 8.0× faster |
+| **Certus** (1 thread) | **8,653 ms** | **8,653 ms** (least CPU) | 5,412 ms | **3.2× faster** |
+| Lean kernel replay (`leanchecker`) | 10,247 ms | 10,245 ms | 6,307 ms | 2.7× faster |
+| Lean, build from source | 27,993 ms | 66,761 ms | 9,039 ms | 1× |
+
+The CI run's explicit rounds, for comparison: round 1 Certus 8 ms, nanoda 6 ms, con-leche 15 ms, Lean build 247 ms; round 2 Certus 301 ms, nanoda 181 ms, con-leche 287 ms, `leanchecker` 1,220 ms, Lean build 10,054 ms, Metamath 6,390 ms.
+
 ## What it shows
 
 1. **Checking a certificate beats rebuilding by 15–45×**, for every independent checker. Most of Lean's build is searching for proofs, which the certificate makes unnecessary. That is the core claim of Certus, now measured end to end.
 2. **Certus does the least work.** It uses the least CPU of any checker: 382 ms against nanoda's 602 ms and con-leche's 1,868 ms. It is slower on the clock only because it runs on one core while nanoda uses eight. **Making Certus parallel is the next milestone**, and on CPU time alone it would then be the fastest.
 3. **Certus only accepts what all three agree on.** nanoda and con-leche both accept the same certificates. Certus also rejects all seven tampered versions in its test suite: a wrong proof, a changed statement, a missing definition, a forged recursor, data posing as a theorem, an injected field, and a `partial` definition.
 4. **Lean's own checkers trust their imports.** `leanchecker` and the Lean build re-check only the file's own declarations and load the rest from `.olean` files. Certus re-checks everything the theorem depends on, and is still faster.
+5. **Automation narrows the gap but does not close it.** `simp` and `omega` find their proofs quickly, but the proofs they leave behind are large, so checking the certificate costs more. On 1,000 automated copies every certificate checker still beats the Lean build (3.2–9.5× in CI), and Certus still uses the least CPU (8.7 s against nanoda's 10.8 s and con-leche's 13.8 s). Here single-threading costs Certus the most: on the clock it is 3× behind nanoda.
 
 ## Other provers: Rocq, Agda, Isabelle, HOL Light
 
@@ -53,7 +92,6 @@ Loading the HOL Light core before the script took most of that session's 128 s o
 
 ## Not in the race (yet)
 
-- **The automated (`simp`/`omega`) proof.** It depends on `Lean.Syntax`, a *nested* inductive type. Certus now checks it (1,341 declarations, 4.2 MB certificate, about 190 ms; nanoda and con-leche accept the same certificate), but it has not been raced yet.
 - **Lean4Lean.** The binary we have was built for a different Lean version.
 - **Metamath on just this theorem.** set.mm's `arisum` depends on 4,594 earlier theorems. Verifying them one command at a time took 44 s, almost all of it command overhead, so the number would mislead. The whole-library time above is the fair Metamath figure.
 
@@ -69,4 +107,4 @@ Missing optional checkers (leanchecker, nanoda, con-leche, Metamath) are skipped
 
 ## In CI
 
-`.github/workflows/race.yml` runs the race on every push to `main` (and on demand) on a GitHub Linux runner: Lean 4.36.0 via elan, lean4export, nanoda and con-leche built from pinned sources, Metamath and set.mm fetched as in `proof-bench/bench.sh`. The JSON and the tables are uploaded as the `race-results` artifact and shown in the run summary. The job fails if any checker rejects a valid certificate, if Certus accepts a tampered one, or if a checker is missing.
+`.github/workflows/race.yml` runs the race on every push to `main` (and on demand) on a GitHub Linux runner: Lean 4.36.0 via elan, lean4export, nanoda and con-leche built from pinned sources, Metamath and set.mm fetched as in `proof-bench/bench.sh`. It runs all four rounds. The JSON and the tables are uploaded as the `race-results` artifact and shown in the run summary. The job fails if any checker rejects a valid certificate, if Certus accepts a tampered one, or if a checker is missing.
