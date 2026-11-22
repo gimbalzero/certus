@@ -172,13 +172,9 @@ pub fn hash_env_with(env: &Env, mode: Mode) -> Hashes {
         levels.push(h);
     }
 
-    let mut exprs: Vec<Hash> = Vec::with_capacity(env.exprs.len());
-    for e in &env.exprs {
-        let h = expr_node(&k, faithful, e, &names, &levels, |i| exprs[i as usize]);
-        exprs.push(h);
-    }
-
-    let decls: Vec<Hash> = env.decls.iter().map(|d| hash_decl(&k, d, &names, &exprs)).collect();
+    let jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let exprs = hash_exprs(env, &k, faithful, &names, &levels, jobs);
+    let decls: Vec<Hash> = par_map(&env.decls, jobs, |d| hash_decl(&k, d, &names, &exprs));
 
     let mut root = Enc::new(&k, ENV_ROOT);
     root.u64(decls.len() as u64);
@@ -188,6 +184,92 @@ pub fn hash_env_with(env: &Env, mode: Mode) -> Hashes {
     let root = root.done();
 
     Hashes { names, levels, exprs, decls, root }
+}
+
+/// Below this many nodes, hashing in parallel is not worth starting threads.
+const PAR_MIN: usize = 1 << 13;
+
+/// Map `f` over `xs` on up to `jobs` threads, keeping the order.
+fn par_map<T: Sync, R: Send>(xs: &[T], jobs: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    par_map_min(xs, jobs, PAR_MIN, f)
+}
+
+fn par_map_min<T: Sync, R: Send>(xs: &[T], jobs: usize, min: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if jobs <= 1 || xs.len() < min.max(1) {
+        return xs.iter().map(f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let hs: Vec<_> =
+            xs.chunks(xs.len().div_ceil(jobs)).map(|c| s.spawn(move || c.iter().map(f).collect::<Vec<R>>())).collect();
+        hs.into_iter().flat_map(|h| h.join().expect("hash thread panicked")).collect()
+    })
+}
+
+/// Hash every expression. An expression's hash needs only its children's, and
+/// children always have smaller ids, so expressions are grouped by height
+/// (leaves 0, every other node one more than its highest child) and each
+/// height is hashed in parallel once the heights below it are done. The
+/// hashes are exactly those of hashing in id order.
+fn hash_exprs(env: &Env, k: &[u8; 32], faithful: bool, names: &[Hash], levels: &[Hash], jobs: usize) -> Vec<Hash> {
+    hash_exprs_min(env, k, faithful, names, levels, jobs, PAR_MIN)
+}
+
+fn hash_exprs_min(
+    env: &Env,
+    k: &[u8; 32],
+    faithful: bool,
+    names: &[Hash],
+    levels: &[Hash],
+    jobs: usize,
+    min: usize,
+) -> Vec<Hash> {
+    let n = env.exprs.len();
+    let mut out: Vec<Hash> = Vec::with_capacity(n);
+    if jobs <= 1 || n < min {
+        for e in &env.exprs {
+            let h = expr_node(k, faithful, e, names, levels, |i| out[i as usize]);
+            out.push(h);
+        }
+        return out;
+    }
+    let mut height = vec![0u32; n];
+    for (i, e) in env.exprs.iter().enumerate() {
+        let h = |c: &ExprId| height[*c as usize] + 1;
+        height[i] = match e {
+            Expr::App { f, a } => h(f).max(h(a)),
+            Expr::Lam { ty, body, .. } | Expr::Pi { ty, body, .. } => h(ty).max(h(body)),
+            Expr::Let { ty, val, body, .. } => h(ty).max(h(val)).max(h(body)),
+            Expr::Proj { structure, .. } => h(structure),
+            Expr::BVar(_) | Expr::Sort(_) | Expr::Const { .. } | Expr::NatLit(_) | Expr::StrLit(_) => 0,
+        };
+    }
+    // Ids by height (counting sort), each height's ids in increasing order.
+    let top = height.iter().copied().max().unwrap_or(0) as usize;
+    let mut start = vec![0usize; top + 2];
+    for &h in &height {
+        start[h as usize + 1] += 1;
+    }
+    for i in 1..start.len() {
+        start[i] += start[i - 1];
+    }
+    let mut order = vec![0u32; n];
+    let mut fill = start.clone();
+    for (i, &h) in height.iter().enumerate() {
+        order[fill[h as usize]] = i as u32;
+        fill[h as usize] += 1;
+    }
+    drop((height, fill));
+    out.resize(n, [0; 32]);
+    for h in 0..=top {
+        let ids = &order[start[h]..start[h + 1]];
+        let node = |i: &u32| expr_node(k, faithful, &env.exprs[*i as usize], names, levels, |c| out[c as usize]);
+        let hashed = par_map_min(ids, jobs, min, node);
+        for (&i, v) in ids.iter().zip(hashed) {
+            out[i as usize] = v;
+        }
+    }
+    out
 }
 
 fn name_node(k: &[u8; 32], n: &Name, pre: impl Fn(NameId) -> Hash) -> Hash {
@@ -414,4 +496,29 @@ fn hash_decl_with(k: &[u8; 32], d: &Decl, n: &[Hash], e: &dyn Fn(ExprId) -> Hash
 
 pub fn hex(h: &Hash) -> String {
     h.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+
+    /// Hashing by height on several threads gives exactly the hashes of
+    /// hashing in id order, even when every height is split across threads.
+    #[test]
+    fn parallel_expression_hashes_equal_sequential_ones() {
+        for fixture in ["tests/fixtures/alpha.ndjson", "tests/fixtures/tiny.ndjson"] {
+            let text = std::fs::read(fixture).unwrap();
+            let env = crate::parse(&text[..]).unwrap();
+            for mode in [Mode::Faithful, Mode::AlphaNormal] {
+                let k = key_for(mode);
+                let f = mode == Mode::Faithful;
+                let names: Vec<Hash> = hash_env_with(&env, mode).names;
+                let levels: Vec<Hash> = hash_env_with(&env, mode).levels;
+                let one = hash_exprs_min(&env, &k, f, &names, &levels, 1, 0);
+                for jobs in [2, 3, 8] {
+                    assert_eq!(one, hash_exprs_min(&env, &k, f, &names, &levels, jobs, 0), "{fixture} jobs {jobs}");
+                }
+            }
+        }
+    }
 }

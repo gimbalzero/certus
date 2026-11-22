@@ -590,7 +590,31 @@ struct Builder {
 }
 
 /// Parse a whole export. Fails on the first malformed record.
-pub fn parse<R: BufRead>(mut reader: R) -> Result<Env, ParseError> {
+pub fn parse<R: BufRead>(reader: R) -> Result<Env, ParseError> {
+    parse_jobs(reader, std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// Bytes of input each thread decodes per batch.
+const BATCH_PER_THREAD: usize = 1 << 20;
+
+/// One line of a batch, decoded: its line number within the batch, and the
+/// record or why it is not one.
+type Decoded = (u64, Result<Rec, String>);
+
+/// [`parse`] with `jobs` threads decoding JSON. Lines are decoded in
+/// parallel, a batch at a time, then added to the environment in file order
+/// by one thread, so the result, and the first error reported, are the same
+/// for every `jobs`.
+pub fn parse_jobs<R: BufRead>(reader: R, jobs: usize) -> Result<Env, ParseError> {
+    parse_batched(reader, jobs, BATCH_PER_THREAD)
+}
+
+/// [`parse_jobs`] with batches of `batch` bytes per thread. Tests use tiny
+/// batches, so that lines cross batch boundaries.
+#[doc(hidden)]
+pub fn parse_batched<R: BufRead>(mut reader: R, jobs: usize, batch: usize) -> Result<Env, ParseError> {
+    let jobs = jobs.max(1);
+    let batch = batch.max(1);
     let mut b = Builder {
         meta: None,
         name_ids: IdMap::default(),
@@ -604,23 +628,51 @@ pub fn parse<R: BufRead>(mut reader: R) -> Result<Env, ParseError> {
         decls: Vec::new(),
         decl_of_name: HashMap::new(),
     };
-    let mut buf = String::new();
     let (mut lines, mut bytes) = (0u64, 0u64);
-    loop {
-        buf.clear();
-        let n =
-            reader.read_line(&mut buf).map_err(|e| ParseError { line: lines + 1, msg: format!("read error: {e}") })?;
-        if n == 0 {
-            break;
+    let mut block: Vec<u8> = Vec::new();
+    let mut eof = false;
+    let mut want = batch * jobs;
+    while !eof {
+        // Fill a block, then hold back any partial last line for the next one.
+        while block.len() < want {
+            let avail =
+                reader.fill_buf().map_err(|e| ParseError { line: lines + 1, msg: format!("read error: {e}") })?;
+            if avail.is_empty() {
+                eof = true;
+                break;
+            }
+            let n = avail.len();
+            block.extend_from_slice(avail);
+            reader.consume(n);
         }
-        lines += 1;
-        bytes += n as u64;
-        let text = buf.trim_end();
-        if text.is_empty() {
+        let cut = if eof { block.len() } else { block.iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1) };
+        if cut == 0 && !eof {
+            // A line longer than the whole block: read a bigger block.
+            want *= 2;
             continue;
         }
-        let rec: Line = serde_json::from_str(text).map_err(|e| ParseError { line: lines, msg: e.to_string() })?;
-        b.add(rec, lines == 1).map_err(|msg| ParseError { line: lines, msg })?;
+        want = batch * jobs;
+        let rest = block.split_off(cut);
+        let pieces = split_lines(&block, jobs);
+        let decoded: Vec<(Vec<Decoded>, u64)> = if pieces.len() <= 1 {
+            pieces.iter().enumerate().map(|(k, p)| decode(p, lines == 0 && k == 0)).collect()
+        } else {
+            std::thread::scope(|s| {
+                let hs: Vec<_> =
+                    pieces.iter().enumerate().map(|(k, p)| s.spawn(move || decode(p, lines == 0 && k == 0))).collect();
+                hs.into_iter().map(|h| h.join().expect("decoder thread panicked")).collect()
+            })
+        };
+        for (records, n) in decoded {
+            for (rel, rec) in records {
+                let line = lines + rel;
+                let rec = rec.map_err(|msg| ParseError { line, msg })?;
+                b.add(rec).map_err(|msg| ParseError { line, msg })?;
+            }
+            lines += n;
+        }
+        bytes += block.len() as u64;
+        block = rest;
     }
     let meta = b.meta.ok_or(ParseError { line: 0, msg: "empty export: no meta record".into() })?;
     Ok(Env {
@@ -634,6 +686,60 @@ pub fn parse<R: BufRead>(mut reader: R) -> Result<Env, ParseError> {
         bytes,
         lines,
     })
+}
+
+/// Split `block` into at most `n` pieces of whole lines.
+fn split_lines(block: &[u8], n: usize) -> Vec<&[u8]> {
+    let mut out = Vec::with_capacity(n);
+    let mut start = 0;
+    for k in 1..n {
+        let target = (block.len() * k / n).max(start);
+        let end = match block[target..].iter().position(|&c| c == b'\n') {
+            Some(i) => target + i + 1,
+            None => break,
+        };
+        if end > start {
+            out.push(&block[start..end]);
+            start = end;
+        }
+    }
+    if start < block.len() {
+        out.push(&block[start..]);
+    }
+    out
+}
+
+/// Decode and classify the lines of `piece`, numbered from 1, stopping at the
+/// first one that is not a valid record. `file_start`: the piece starts the
+/// file, so its line 1 must be the meta record. Also returns how many lines
+/// the piece has.
+fn decode(piece: &[u8], file_start: bool) -> (Vec<Decoded>, u64) {
+    let mut out = Vec::new();
+    let mut n = 0u64;
+    for raw in piece.split_inclusive(|&c| c == b'\n') {
+        n += 1;
+        let text = match std::str::from_utf8(raw) {
+            Ok(t) => t.trim_end(),
+            Err(_) => {
+                out.push((n, Err("read error: stream did not contain valid UTF-8".to_string())));
+                return (out, n);
+            }
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let rec = serde_json::from_str::<Line>(text)
+            .map_err(|e| e.to_string())
+            .and_then(|r| classify(r, file_start && n == 1));
+        let bad = rec.is_err();
+        out.push((n, rec));
+        if bad {
+            break;
+        }
+    }
+    // Lines after an error are not decoded, but still counted.
+    n = piece.split_inclusive(|&c| c == b'\n').count() as u64;
+    (out, n)
 }
 
 impl Builder {
@@ -652,195 +758,249 @@ impl Builder {
         self.expr_ids.get(id, self.exprs.len()).ok_or_else(|| format!("reference to undefined expression {id}"))
     }
 
-    fn add(&mut self, r: Line, first: bool) -> Result<(), String> {
-        let Line {
-            in_id,
-            il,
-            ie,
-            str,
-            num,
-            succ,
-            max,
-            imax,
-            param,
-            bvar,
-            sort,
-            cnst,
-            app,
-            lam,
-            forall_e,
-            let_e,
-            proj,
-            nat_val,
-            str_val,
-            meta,
-            axiom,
-            def,
-            thm,
-            opaque,
-            quot,
-            inductive,
-        } = r;
-
-        let name_payloads = [str.is_some(), num.is_some()];
-        let level_payloads = [succ.is_some(), max.is_some(), imax.is_some(), param.is_some()];
-        let expr_payloads = [
-            bvar.is_some(),
-            sort.is_some(),
-            cnst.is_some(),
-            app.is_some(),
-            lam.is_some(),
-            forall_e.is_some(),
-            let_e.is_some(),
-            proj.is_some(),
-            nat_val.is_some(),
-            str_val.is_some(),
-        ];
-        let decl_payloads =
-            [axiom.is_some(), def.is_some(), thm.is_some(), opaque.is_some(), quot.is_some(), inductive.is_some()];
-        let count = |v: &[bool]| v.iter().filter(|x| **x).count();
-        let (np, lp, ep, dp, mp) = (
-            count(&name_payloads),
-            count(&level_payloads),
-            count(&expr_payloads),
-            count(&decl_payloads),
-            meta.is_some() as usize,
-        );
-        if np + lp + ep + dp + mp != 1 {
-            return Err("record must have exactly one payload".into());
-        }
-        if first != (mp == 1) {
-            return Err("the meta record must be the first line, and only the first".into());
-        }
-        let ids = (in_id.is_some(), il.is_some(), ie.is_some());
-        let ok_ids = match (np, lp, ep) {
-            (1, _, _) => ids == (true, false, false),
-            (_, 1, _) => ids == (false, true, false),
-            (_, _, 1) => ids == (false, false, true),
-            _ => ids == (false, false, false),
-        };
-        if !ok_ids {
-            return Err("record has the wrong kind of id for its payload".into());
-        }
-
-        if let Some(m) = meta {
-            if !m.format.version.starts_with("3.") {
-                return Err(format!("unsupported export format {}, expected 3.x", m.format.version));
+    /// Add one classified record. Only this needs the records before it.
+    fn add(&mut self, r: Rec) -> Result<(), String> {
+        match r {
+            Rec::Meta(m) => {
+                self.meta = Some(*m);
+                Ok(())
             }
-            self.meta = Some(m);
-            return Ok(());
-        }
-
-        if let Some(id) = in_id {
-            let (name, key) = if let Some(s) = str {
-                let pre = self.name(s.pre)?;
-                (Name::Str { pre, s: s.str.clone() }, NameKey::Str(pre, s.str))
-            } else {
-                let n = num.expect("checked above");
-                let pre = self.name(n.pre)?;
-                (Name::Num { pre, n: n.i }, NameKey::Num(pre, n.i))
-            };
-            let id = self.name_ids.define("name", id, self.names.len())?;
-            let canon = *self.name_index.entry(key).or_insert(id);
-            self.names.push(name);
-            self.name_canon.push(canon);
-            return Ok(());
-        }
-
-        if let Some(id) = il {
-            let lvl = if let Some(a) = succ {
-                Level::Succ(self.level(a)?)
-            } else if let Some([a, b]) = max {
-                Level::Max(self.level(a)?, self.level(b)?)
-            } else if let Some([a, b]) = imax {
-                Level::IMax(self.level(a)?, self.level(b)?)
-            } else {
-                Level::Param(self.name(param.expect("checked above"))?)
-            };
-            self.level_ids.define("level", id, self.levels.len())?;
-            self.levels.push(lvl);
-            return Ok(());
-        }
-
-        if let Some(id) = ie {
-            let e = if let Some(i) = bvar {
-                Expr::BVar(i)
-            } else if let Some(l) = sort {
-                Expr::Sort(self.level(l)?)
-            } else if let Some(c) = cnst {
-                let levels = c.us.iter().map(|&l| self.level(l)).collect::<Result<Vec<_>, _>>()?;
-                Expr::Const { name: self.name(c.name)?, levels: levels.into_boxed_slice() }
-            } else if let Some(a) = app {
-                Expr::App { f: self.expr(a.f)?, a: self.expr(a.arg)? }
-            } else if let Some(x) = lam {
-                Expr::Lam {
-                    name: self.name(x.name)?,
-                    ty: self.expr(x.r#type)?,
-                    body: self.expr(x.body)?,
-                    bi: x.binder_info,
+            Rec::Name { id, name } => {
+                let (name, key) = match name {
+                    Name::Str { pre, s } => {
+                        let pre = self.name(pre)?;
+                        (Name::Str { pre, s: s.clone() }, NameKey::Str(pre, s))
+                    }
+                    Name::Num { pre, n } => {
+                        let pre = self.name(pre)?;
+                        (Name::Num { pre, n }, NameKey::Num(pre, n))
+                    }
+                    Name::Anon => unreachable!("classify never makes an anonymous name record"),
+                };
+                let id = self.name_ids.define("name", id, self.names.len())?;
+                let canon = *self.name_index.entry(key).or_insert(id);
+                self.names.push(name);
+                self.name_canon.push(canon);
+                Ok(())
+            }
+            Rec::Level { id, l } => {
+                let lvl = match l {
+                    Level::Succ(a) => Level::Succ(self.level(a)?),
+                    Level::Max(a, b) => Level::Max(self.level(a)?, self.level(b)?),
+                    Level::IMax(a, b) => Level::IMax(self.level(a)?, self.level(b)?),
+                    Level::Param(n) => Level::Param(self.name(n)?),
+                    Level::Zero => unreachable!("classify never makes a zero level record"),
+                };
+                self.level_ids.define("level", id, self.levels.len())?;
+                self.levels.push(lvl);
+                Ok(())
+            }
+            Rec::Expr { id, e } => {
+                let e = match e {
+                    Expr::BVar(i) => Expr::BVar(i),
+                    Expr::Sort(l) => Expr::Sort(self.level(l)?),
+                    Expr::Const { name, levels } => {
+                        let levels = levels.iter().map(|&l| self.level(l)).collect::<Result<Vec<_>, _>>()?;
+                        Expr::Const { name: self.name(name)?, levels: levels.into_boxed_slice() }
+                    }
+                    Expr::App { f, a } => Expr::App { f: self.expr(f)?, a: self.expr(a)? },
+                    Expr::Lam { name, ty, body, bi } => {
+                        Expr::Lam { name: self.name(name)?, ty: self.expr(ty)?, body: self.expr(body)?, bi }
+                    }
+                    Expr::Pi { name, ty, body, bi } => {
+                        Expr::Pi { name: self.name(name)?, ty: self.expr(ty)?, body: self.expr(body)?, bi }
+                    }
+                    Expr::Let { name, ty, val, body, nondep } => Expr::Let {
+                        name: self.name(name)?,
+                        ty: self.expr(ty)?,
+                        val: self.expr(val)?,
+                        body: self.expr(body)?,
+                        nondep,
+                    },
+                    Expr::Proj { type_name, idx, structure } => {
+                        Expr::Proj { type_name: self.name(type_name)?, idx, structure: self.expr(structure)? }
+                    }
+                    lit @ (Expr::NatLit(_) | Expr::StrLit(_)) => lit,
+                };
+                self.expr_ids.define("expression", id, self.exprs.len())?;
+                self.exprs.push(e);
+                Ok(())
+            }
+            Rec::Decl(d) => {
+                let mut d = *d;
+                d.map_names(&mut |n| self.name(n))?;
+                for e in d.roots() {
+                    self.expr(e)?;
                 }
-            } else if let Some(x) = forall_e {
-                Expr::Pi {
-                    name: self.name(x.name)?,
-                    ty: self.expr(x.r#type)?,
-                    body: self.expr(x.body)?,
-                    bi: x.binder_info,
+                if self.expr_ids.sparse.is_some() {
+                    // Every root resolves (checked just above).
+                    d.map_exprs(&mut |e| self.expr_ids.get(e, self.exprs.len()).expect("checked above"));
                 }
-            } else if let Some(x) = let_e {
-                Expr::Let {
-                    name: self.name(x.name)?,
-                    ty: self.expr(x.r#type)?,
-                    val: self.expr(x.value)?,
-                    body: self.expr(x.body)?,
-                    nondep: x.nondep,
+                let idx = self.decls.len();
+                for n in d.defined_names() {
+                    if self.decl_of_name.insert(n, idx).is_some() {
+                        return Err(format!("constant defined twice (name id {n})"));
+                    }
                 }
-            } else if let Some(p) = proj {
-                Expr::Proj { type_name: self.name(p.type_name)?, idx: p.idx, structure: self.expr(p.structure)? }
-            } else if let Some(n) = nat_val {
-                let canonical =
-                    !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) && (n == "0" || !n.starts_with('0'));
-                if !canonical {
-                    return Err(format!("malformed natural-number literal {n:?}"));
-                }
-                Expr::NatLit(n.into_boxed_str())
-            } else {
-                Expr::StrLit(str_val.expect("checked above").into_boxed_str())
-            };
-            self.expr_ids.define("expression", id, self.exprs.len())?;
-            self.exprs.push(e);
-            return Ok(());
-        }
-
-        let mut d = if let Some(x) = axiom {
-            Decl::Axiom(x)
-        } else if let Some(x) = def {
-            Decl::Def(x)
-        } else if let Some(x) = thm {
-            Decl::Thm(x)
-        } else if let Some(x) = opaque {
-            Decl::Opaque(x)
-        } else if let Some(x) = quot {
-            Decl::Quot(x)
-        } else {
-            Decl::Inductive(inductive.expect("checked above"))
-        };
-        d.map_names(&mut |n| self.name(n))?;
-        for e in d.roots() {
-            self.expr(e)?;
-        }
-        if self.expr_ids.sparse.is_some() {
-            // Every root resolves (checked just above).
-            d.map_exprs(&mut |e| self.expr_ids.get(e, self.exprs.len()).expect("checked above"));
-        }
-        let idx = self.decls.len();
-        for n in d.defined_names() {
-            if self.decl_of_name.insert(n, idx).is_some() {
-                return Err(format!("constant defined twice (name id {n})"));
+                self.decls.push(d);
+                Ok(())
             }
         }
-        self.decls.push(d);
-        Ok(())
     }
+}
+
+/// A record, checked as far as it can be on its own; ids are still the file's.
+enum Rec {
+    Meta(Box<Meta>),
+    Name { id: u32, name: Name },
+    Level { id: u32, l: Level },
+    Expr { id: u32, e: Expr },
+    Decl(Box<Decl>),
+}
+
+/// Everything about a record that does not depend on the records before it:
+/// exactly one payload, the right kind of id, the meta record first, the
+/// format version and well-formed literals. Runs on many threads at once.
+fn classify(r: Line, first: bool) -> Result<Rec, String> {
+    let Line {
+        in_id,
+        il,
+        ie,
+        str,
+        num,
+        succ,
+        max,
+        imax,
+        param,
+        bvar,
+        sort,
+        cnst,
+        app,
+        lam,
+        forall_e,
+        let_e,
+        proj,
+        nat_val,
+        str_val,
+        meta,
+        axiom,
+        def,
+        thm,
+        opaque,
+        quot,
+        inductive,
+    } = r;
+
+    let name_payloads = [str.is_some(), num.is_some()];
+    let level_payloads = [succ.is_some(), max.is_some(), imax.is_some(), param.is_some()];
+    let expr_payloads = [
+        bvar.is_some(),
+        sort.is_some(),
+        cnst.is_some(),
+        app.is_some(),
+        lam.is_some(),
+        forall_e.is_some(),
+        let_e.is_some(),
+        proj.is_some(),
+        nat_val.is_some(),
+        str_val.is_some(),
+    ];
+    let decl_payloads =
+        [axiom.is_some(), def.is_some(), thm.is_some(), opaque.is_some(), quot.is_some(), inductive.is_some()];
+    let count = |v: &[bool]| v.iter().filter(|x| **x).count();
+    let (np, lp, ep, dp, mp) = (
+        count(&name_payloads),
+        count(&level_payloads),
+        count(&expr_payloads),
+        count(&decl_payloads),
+        meta.is_some() as usize,
+    );
+    if np + lp + ep + dp + mp != 1 {
+        return Err("record must have exactly one payload".into());
+    }
+    if first != (mp == 1) {
+        return Err("the meta record must be the first line, and only the first".into());
+    }
+    let ids = (in_id.is_some(), il.is_some(), ie.is_some());
+    let ok_ids = match (np, lp, ep) {
+        (1, _, _) => ids == (true, false, false),
+        (_, 1, _) => ids == (false, true, false),
+        (_, _, 1) => ids == (false, false, true),
+        _ => ids == (false, false, false),
+    };
+    if !ok_ids {
+        return Err("record has the wrong kind of id for its payload".into());
+    }
+
+    if let Some(m) = meta {
+        if !m.format.version.starts_with("3.") {
+            return Err(format!("unsupported export format {}, expected 3.x", m.format.version));
+        }
+        return Ok(Rec::Meta(Box::new(m)));
+    }
+    if let Some(id) = in_id {
+        let name = if let Some(s) = str {
+            Name::Str { pre: s.pre, s: s.str }
+        } else {
+            let n = num.expect("checked above");
+            Name::Num { pre: n.pre, n: n.i }
+        };
+        return Ok(Rec::Name { id, name });
+    }
+    if let Some(id) = il {
+        let l = if let Some(a) = succ {
+            Level::Succ(a)
+        } else if let Some([a, b]) = max {
+            Level::Max(a, b)
+        } else if let Some([a, b]) = imax {
+            Level::IMax(a, b)
+        } else {
+            Level::Param(param.expect("checked above"))
+        };
+        return Ok(Rec::Level { id, l });
+    }
+    if let Some(id) = ie {
+        let e = if let Some(i) = bvar {
+            Expr::BVar(i)
+        } else if let Some(l) = sort {
+            Expr::Sort(l)
+        } else if let Some(c) = cnst {
+            Expr::Const { name: c.name, levels: c.us.into_boxed_slice() }
+        } else if let Some(a) = app {
+            Expr::App { f: a.f, a: a.arg }
+        } else if let Some(x) = lam {
+            Expr::Lam { name: x.name, ty: x.r#type, body: x.body, bi: x.binder_info }
+        } else if let Some(x) = forall_e {
+            Expr::Pi { name: x.name, ty: x.r#type, body: x.body, bi: x.binder_info }
+        } else if let Some(x) = let_e {
+            Expr::Let { name: x.name, ty: x.r#type, val: x.value, body: x.body, nondep: x.nondep }
+        } else if let Some(p) = proj {
+            Expr::Proj { type_name: p.type_name, idx: p.idx, structure: p.structure }
+        } else if let Some(n) = nat_val {
+            let canonical = !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) && (n == "0" || !n.starts_with('0'));
+            if !canonical {
+                return Err(format!("malformed natural-number literal {n:?}"));
+            }
+            Expr::NatLit(n.into_boxed_str())
+        } else {
+            Expr::StrLit(str_val.expect("checked above").into_boxed_str())
+        };
+        return Ok(Rec::Expr { id, e });
+    }
+    let d = if let Some(x) = axiom {
+        Decl::Axiom(x)
+    } else if let Some(x) = def {
+        Decl::Def(x)
+    } else if let Some(x) = thm {
+        Decl::Thm(x)
+    } else if let Some(x) = opaque {
+        Decl::Opaque(x)
+    } else if let Some(x) = quot {
+        Decl::Quot(x)
+    } else {
+        Decl::Inductive(inductive.expect("checked above"))
+    };
+    Ok(Rec::Decl(Box::new(d)))
 }
 
 impl Env {
