@@ -127,6 +127,33 @@ pub struct TC<'a> {
     eq_cache: FxHashSet<(E, E)>,
     neq_cache: FxHashSet<(E, E)>,
     fuel: u64,
+    /// Terms kept by all collections so far, and the collection threshold
+    /// (see `end_region`).
+    gc_kept: usize,
+    gc_min: usize,
+}
+
+/// A reduction that creates at least this many terms has the ones nothing
+/// needs forgotten when it ends (see `TC::end_region`).
+pub const GC_MIN: usize = 1 << 21;
+
+/// Threshold used instead of `GC_MIN` (0: none). For tests only: a small
+/// threshold makes collections happen on small inputs, so that tests can
+/// check that they never change a verdict.
+static GC_MIN_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub fn set_collect_threshold_for_tests(n: usize) {
+    GC_MIN_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where a reduction started (see `TC::region`).
+#[derive(Clone, Copy)]
+struct Region {
+    nodes: usize,
+    kept: usize,
+    lctx: usize,
+    local: usize,
 }
 
 impl<'a> TC<'a> {
@@ -148,6 +175,11 @@ impl<'a> TC<'a> {
             eq_cache: FxHashSet::default(),
             neq_cache: FxHashSet::default(),
             fuel: DEFAULT_FUEL,
+            gc_kept: 0,
+            gc_min: match GC_MIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => GC_MIN,
+                n => n,
+            },
         }
     }
 
@@ -507,6 +539,97 @@ impl<'a> TC<'a> {
         Ok(r)
     }
 
+    fn region(&self) -> Region {
+        Region { nodes: self.st.num_nodes(), kept: self.gc_kept, lctx: self.lctx.len(), local: self.local.len() }
+    }
+
+    /// End a reduction that started at `reg` and produced `r`: if it created
+    /// many terms, forget all of them except those `r` is built from and the
+    /// cached `whnf` results of terms that stay, and return `r`'s new id.
+    ///
+    /// Soundness: every term that existed when the reduction started keeps
+    /// its id, so whatever the callers hold stays valid. Terms created since
+    /// can only have escaped through `r`, the caches and the local context.
+    /// `r` is kept, cache entries are moved to the new ids or dropped, and
+    /// nothing is collected if the local context or the local constants grew
+    /// (their entries could mention new terms).
+    fn end_region(&mut self, reg: Region, r: E) -> E {
+        let n = self.st.num_nodes();
+        // Terms that collections inside this reduction already kept count as
+        // live, so that nested reductions do not each copy the same result.
+        let fresh = (n - reg.nodes).saturating_sub(self.gc_kept - reg.kept);
+        if fresh < self.gc_min || self.lctx.len() != reg.lctx || self.local.len() != reg.local {
+            return r;
+        }
+        let w = E(reg.nodes as u32);
+        // Also keep the cached `whnf` result of every term that stays (older
+        // terms all stay): without them, reductions that share work (such as
+        // the branches of an `ite` on a large computation) redo it after every
+        // collection. The other caches' results are cheaper to recompute.
+        let mut stack = vec![r];
+        let mut later: FxHashMap<E, E> = FxHashMap::default();
+        for (&k, &v) in &self.whnf_cache {
+            if v >= w {
+                if k < w {
+                    stack.push(v);
+                } else {
+                    later.insert(k, v);
+                }
+            }
+        }
+        let mut live: Vec<E> = Vec::new();
+        let mut seen = rustc_hash::FxHashSet::default();
+        while let Some(x) = stack.pop() {
+            if x < w || !seen.insert(x) {
+                continue;
+            }
+            live.push(x);
+            match self.st.node(x) {
+                Node::App(f, a) | Node::Lam(f, a) | Node::Pi(f, a) => stack.extend([f, a]),
+                Node::Let(t, v, b) => stack.extend([t, v, b]),
+                Node::Proj(_, _, y) => stack.push(y),
+                _ => {}
+            }
+            if let Some(v) = later.remove(&x) {
+                stack.push(v);
+            }
+        }
+        drop((later, seen));
+        let moved = self.st.collect(w, &live);
+        let fix = |e: E| if e < w { Some(e) } else { moved.get(&e).copied() };
+        // Fix the caches in place (copying them would double their memory at
+        // the moment memory is tightest). Entries whose key was kept get new
+        // keys; there are few of them, so they are removed and put back.
+        let mut rekeyed: Vec<(E, E)> = Vec::new();
+        for c in [&mut self.infer_cache, &mut self.check_cache, &mut self.whnf_core_cache, &mut self.whnf_cache] {
+            c.retain(|&k, v| match (fix(k), fix(*v)) {
+                (Some(k2), Some(v2)) if k2 == k => {
+                    *v = v2;
+                    true
+                }
+                (Some(k2), Some(v2)) => {
+                    rekeyed.push((k2, v2));
+                    false
+                }
+                _ => false,
+            });
+            c.extend(rekeyed.drain(..));
+        }
+        for c in [&mut self.eq_cache, &mut self.neq_cache] {
+            c.retain(|&(a, b)| match (fix(a), fix(b)) {
+                (Some(a2), Some(b2)) if (a2, b2) == (a, b) => true,
+                (Some(a2), Some(b2)) => {
+                    rekeyed.push((a2, b2));
+                    false
+                }
+                _ => false,
+            });
+            c.extend(rekeyed.drain(..));
+        }
+        self.gc_kept += moved.len();
+        fix(r).expect("the result is kept")
+    }
+
     /// Full weak-head normal form.
     pub fn whnf(&mut self, e: E) -> R<E> {
         match self.st.node(e) {
@@ -518,6 +641,7 @@ impl<'a> TC<'a> {
         if let Some(&r) = self.whnf_cache.get(&e) {
             return Ok(r);
         }
+        let reg = self.region();
         let mut t = e;
         loop {
             self.burn()?;
@@ -534,6 +658,7 @@ impl<'a> TC<'a> {
                 }
             }
         }
+        let t = self.end_region(reg, t);
         self.whnf_cache.insert(e, t);
         Ok(t)
     }

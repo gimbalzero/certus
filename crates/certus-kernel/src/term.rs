@@ -193,6 +193,77 @@ impl Store {
         Frozen(Arc::new(self.own))
     }
 
+    /// Add to `seen` every term with an id of `w` or more that `roots` are
+    /// built from (see [`Store::collect`]).
+    fn mark_live(&self, w: E, roots: &[E], seen: &mut rustc_hash::FxHashSet<E>) {
+        let mut stack: Vec<E> = roots.to_vec();
+        while let Some(x) = stack.pop() {
+            if x < w || !seen.insert(x) {
+                continue;
+            }
+            match self.node(x) {
+                Node::App(f, a) | Node::Lam(f, a) | Node::Pi(f, a) => stack.extend([f, a]),
+                Node::Let(t, v, b) => stack.extend([t, v, b]),
+                Node::Proj(_, _, y) => stack.push(y),
+                _ => {}
+            }
+        }
+    }
+
+    /// Forget every term with an id of `w` or more, except those reachable
+    /// from `roots`, which are interned again (with new ids, from `w` up).
+    /// Returns the new id of each kept term.
+    ///
+    /// Forgotten ids are given to other terms afterwards, so the caller must
+    /// make sure that nothing outside this store holds one, except through
+    /// the returned map (see `TC::end_region`). Terms below `w` never refer to
+    /// later ones, so they all stay valid. Levels, level lists and literals
+    /// are kept. Only terms of this store, not of its base, can be forgotten.
+    pub fn collect(&mut self, w: E, roots: &[E]) -> FxHashMap<E, E> {
+        assert!(w.0 >= self.nb && w.0 as usize <= self.num_nodes(), "collect below the store's own terms");
+        let mut seen = rustc_hash::FxHashSet::default();
+        self.mark_live(w, roots, &mut seen);
+        let mut keep: Vec<E> = seen.into_iter().collect();
+        // A term's parts are older than the term, so ascending ids put every
+        // part before the terms built from it.
+        keep.sort_unstable();
+        let kept: Vec<(E, Node)> = keep.iter().map(|&x| (x, self.node(x))).collect();
+        let from = (w.0 - self.nb) as usize;
+        for n in &self.own.nodes[from..] {
+            self.own.map.remove(n);
+        }
+        self.own.nodes.truncate(from);
+        self.own.info.truncate(from);
+        let mut moved: FxHashMap<E, E> = FxHashMap::default();
+        let m = |moved: &FxHashMap<E, E>, e: E| if e < w { e } else { moved[&e] };
+        for (old, n) in kept {
+            let n = match n {
+                Node::App(f, a) => Node::App(m(&moved, f), m(&moved, a)),
+                Node::Lam(d, b) => Node::Lam(m(&moved, d), m(&moved, b)),
+                Node::Pi(d, b) => Node::Pi(m(&moved, d), m(&moved, b)),
+                Node::Let(t, v, b) => Node::Let(m(&moved, t), m(&moved, v), m(&moved, b)),
+                Node::Proj(s, i, x) => Node::Proj(s, i, m(&moved, x)),
+                leaf => leaf,
+            };
+            let new = self.mk(n);
+            moved.insert(old, new);
+        }
+        // Cached instantiations: drop those of forgotten terms, move the rest.
+        self.ilp_cache.retain(|k, v| {
+            if k.0 >= w {
+                return false;
+            }
+            if *v >= w {
+                match moved.get(v) {
+                    Some(&n) => *v = n,
+                    None => return false,
+                }
+            }
+            true
+        });
+        moved
+    }
+
     pub fn num_nodes(&self) -> usize {
         self.nb as usize + self.own.nodes.len()
     }
@@ -970,6 +1041,37 @@ mod tests {
             let one = st.succ(st.zero);
             assert_eq!(su2, st.sort(one));
         }
+    }
+
+    #[test]
+    fn collect_keeps_what_the_roots_need_and_ids_stay_canonical() {
+        let mut st = Store::new();
+        let z = st.zero;
+        let p = st.sort(z);
+        let b0 = st.bvar(0);
+        let old = st.mk(Node::Pi(p, p));
+        let w = E(st.num_nodes() as u32);
+        // Garbage, and a root that shares a part with the garbage.
+        let g = st.mk(Node::Lam(old, b0));
+        let _g2 = st.app(g, g);
+        let part = st.app(old, p);
+        let _g3 = st.app(part, g);
+        let root = st.mk(Node::Lam(part, part));
+        let x = E(st.num_nodes() as u32 + 5);
+        let moved = st.collect(w, &[root, x.min(old)]);
+        assert_eq!(moved.len(), 2, "only the root and its part are kept");
+        let (root2, part2) = (moved[&root], moved[&part]);
+        assert_eq!(st.num_nodes(), w.0 as usize + 2);
+        assert_eq!(st.node(part2), Node::App(old, p));
+        assert_eq!(st.node(root2), Node::Lam(part2, part2));
+        // Older terms keep their ids; rebuilding a term finds its new id.
+        assert_eq!(st.mk(Node::Pi(p, p)), old);
+        assert_eq!(st.app(old, p), part2);
+        assert_eq!(st.mk(Node::Lam(part2, part2)), root2);
+        // Forgotten terms are made afresh, past the kept ones.
+        let g = st.mk(Node::Lam(old, b0));
+        assert_eq!(g.0 as usize, w.0 as usize + 2);
+        assert_eq!(st.info(root2).lbr, 0);
     }
 
     #[test]

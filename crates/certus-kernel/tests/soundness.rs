@@ -18,13 +18,30 @@ fn check(text: &str) -> Result<certus_kernel::Report, String> {
     // Multi-core checking must reach exactly the same verdict.
     for jobs in [2, 3, 8] {
         let many = certus_kernel::check_jobs(&env, &closure.decls, jobs).map_err(|e| e.to_string());
-        match (&one, &many) {
-            (Ok(a), Ok(b)) => assert_eq!((a.checked, a.native_nat_ops), (b.checked, b.native_nat_ops)),
-            (Err(a), Err(b)) => assert_eq!(a, b, "--jobs {jobs} gave a different error"),
-            _ => panic!("--jobs {jobs} gave a different verdict: {:?} vs {:?}", one.is_ok(), many.is_ok()),
-        }
+        same_verdict(&one, &many, &format!("--jobs {jobs}"));
     }
+    // So must checking that forgets intermediate terms all the time.
+    let gc = with_tiny_collect_threshold(|| certus_kernel::check(&env, &closure.decls).map_err(|e| e.to_string()));
+    same_verdict(&one, &gc, "collecting terms");
     one
+}
+
+fn same_verdict(one: &Result<certus_kernel::Report, String>, other: &Result<certus_kernel::Report, String>, how: &str) {
+    match (one, other) {
+        (Ok(a), Ok(b)) => assert_eq!((a.checked, a.native_nat_ops), (b.checked, b.native_nat_ops)),
+        (Err(a), Err(b)) => assert_eq!(a, b, "{how} gave a different error"),
+        _ => panic!("{how} gave a different verdict: {:?} vs {:?}", one.is_ok(), other.is_ok()),
+    }
+}
+
+/// Run `f` with term collection after every reduction that creates more than
+/// a handful of terms. The threshold is global, so other tests running at the
+/// same time may collect too; that only checks them harder.
+fn with_tiny_collect_threshold<T>(f: impl FnOnce() -> T) -> T {
+    certus_kernel::set_collect_threshold_for_tests(4);
+    let r = f();
+    certus_kernel::set_collect_threshold_for_tests(0);
+    r
 }
 
 /// The certificate as JSON records, with a way to find declarations by name.
