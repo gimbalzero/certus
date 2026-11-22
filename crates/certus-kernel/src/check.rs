@@ -129,8 +129,7 @@ pub fn check(env: &Env, decls: &[usize]) -> Result<Report, CheckError> {
 
 /// [`check`] on `jobs` threads, with exactly the same verdict.
 ///
-/// On one thread, declarations are checked one after the other, in file
-/// order. On several, checking runs in two phases.
+/// Checking runs in two phases, on any number of threads.
 ///
 /// 1. One thread walks the declarations in file order. It converts every term
 ///    once, into one term store, runs every check that does not need the type
@@ -148,7 +147,9 @@ pub fn check(env: &Env, decls: &[usize]) -> Result<Report, CheckError> {
 ///    sequential checker would build, apart from the builtins (`Nat`
 ///    arithmetic and string literals), which are also taken as they were at
 ///    `p`. Terms the type checker creates go into each thread's own store, on
-///    top of the shared one.
+///    top of the shared one, and are forgotten once the checks that made them
+///    are over (see `forget_check_terms`). With one thread, phase 2 runs on
+///    the store of phase 1 itself, unfrozen.
 ///
 /// Verdict: the failure at the earliest position, as in sequential checking.
 /// Everything before the first failure passes, so its checker sees the same
@@ -178,11 +179,8 @@ pub fn check_with(env: &Env, decls: &[usize], jobs: usize, known_good: &[bool]) 
     }
     let known = |p: usize| known_good.get(p).copied().unwrap_or(false);
     let prep = Prep::new(env);
-    // On one thread, phase 1 also type-checks each declaration as it goes,
-    // which leaves nothing for phase 2.
-    let inline = jobs <= 1;
     let mut pre = std::thread::scope(|s| {
-        let h = spawn_checker(s, "certus-check".into(), || prepare(env, decls, &prep, &known, inline))?;
+        let h = spawn_checker(s, "certus-check".into(), || prepare(env, decls, &prep, &known))?;
         Ok(h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
     })?;
     let todo = pre.todo.iter().filter(|t| t.is_some()).count();
@@ -336,10 +334,8 @@ struct Prepared {
     native_nat_ops: usize,
 }
 
-/// Phase 1 of `check_jobs`. With `inline`, it also type-checks each declaration right away (in the
-/// environment of the declarations before it, as phase 2 would), so no
-/// `todo` is left.
-fn prepare(env: &Env, decls: &[usize], prep: &Prep, known: &dyn Fn(usize) -> bool, inline: bool) -> Prepared {
+/// Phase 1 of `check_jobs`.
+fn prepare(env: &Env, decls: &[usize], prep: &Prep, known: &dyn Fn(usize) -> bool) -> Prepared {
     let strs = &prep.strs;
     let candidates = &prep.candidates;
     let mut st = Store::new();
@@ -383,14 +379,7 @@ fn prepare(env: &Env, decls: &[usize], prep: &Prep, known: &dyn Fn(usize) -> boo
             }
         };
         let t = t.filter(|_| !known(pos));
-        if inline && let Some(t) = &t {
-            let mut tc = TC::new(&mut st, &kenv, t.lparams.clone());
-            if let Err(e) = check_todo(&mut tc, t) {
-                failure = Some((pos, CheckError::new(name(), e)));
-                break;
-            }
-        }
-        if t.is_none() || inline {
+        if t.is_none() {
             times.push((i, t0.elapsed()));
             todo.push(None);
         } else {
@@ -461,6 +450,7 @@ fn run_worker(shared: &Shared, mut st: Store, skip: usize) -> Worker {
     let mut era = usize::MAX;
     let mut times: Vec<(usize, Duration)> = Vec::new();
     let mut failure = None;
+    let mut peak = st.num_nodes();
     loop {
         // Positions are taken in increasing order, so every position before
         // a failure is taken (and checked) by some worker.
@@ -476,17 +466,21 @@ fn run_worker(shared: &Shared, mut st: Store, skip: usize) -> Worker {
         }
         kenv.visible = pos;
         let t0 = Instant::now();
-        let mut tc = TC::new(&mut st, &kenv, t.lparams.clone());
-        if let Err(e) = check_todo(&mut tc, t) {
+        let r = check_todo(&mut TC::new(&mut st, &kenv, t.lparams.clone()), t);
+        if let Err(e) = r {
             failure = Some((pos, CheckError::new(shared.strs[t.decl_name as usize].clone(), e)));
             break;
         }
+        // Everything in this worker's own store was made by checks that are
+        // over: the shared base holds every converted term.
+        peak = peak.max(st.num_nodes());
+        forget_check_terms(&mut st, skip);
         times.push((t.decl, t0.elapsed()));
     }
     if let Some((pos, _)) = &failure {
         shared.first_failure.fetch_min(*pos, Ordering::Relaxed);
     }
-    Worker { failure, times, term_nodes: st.num_nodes() - skip }
+    Worker { failure, times, term_nodes: peak.max(st.num_nodes()) - skip }
 }
 
 /// Fingerprints of the genuine `Nat` operations the kernel computes natively,
@@ -752,6 +746,22 @@ fn hints_of(v: &serde_json::Value) -> R<Hints> {
 }
 
 /// Check that `ty` is a type, under fresh universe parameters.
+/// A finished check leaves nothing that refers to the terms it created: the
+/// type checker and its caches are gone, and the declaration's own terms (and
+/// everything else outside the type checker: constants, converted terms, the
+/// remaining todo) were made before the check started. So every term from
+/// `mark` on can be forgotten once the checks that made them are over
+/// (`Store::collect` with no roots also drops the store's cached
+/// instantiations of them). Each collection scans those cached instantiations,
+/// so it waits until there are this many such terms.
+const ROLLBACK_MIN: usize = 1 << 16;
+
+fn forget_check_terms(st: &mut Store, mark: usize) {
+    if st.num_nodes() - mark >= crate::tc::collect_threshold(ROLLBACK_MIN) {
+        st.collect(E(mark as u32), &[]);
+    }
+}
+
 fn check_type(tc: &mut TC, ty: E) -> R<L> {
     if tc.st.info(ty).lbr != 0 {
         return Err("type has loose bound variables".into());

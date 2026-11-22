@@ -147,6 +147,14 @@ pub fn set_collect_threshold_for_tests(n: usize) {
     GC_MIN_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `default`, or the threshold tests set with [`set_collect_threshold_for_tests`].
+pub(crate) fn collect_threshold(default: usize) -> usize {
+    match GC_MIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => default,
+        n => n,
+    }
+}
+
 /// Where a reduction started (see `TC::region`).
 #[derive(Clone, Copy)]
 struct Region {
