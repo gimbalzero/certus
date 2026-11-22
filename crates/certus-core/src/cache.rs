@@ -122,9 +122,13 @@ impl Implicit {
         let names =
             ["Nat", "String", "String.ofList", "String.mk", "Char", "Char.ofNat", "List.nil", "List.cons", "Eq"];
         let f = env.find_decls(&names);
-        // A literal needs whichever of these exist; a missing one makes the
-        // literal fail in the kernel anyway, so it does not need a key.
-        let string = [f[1], f[2], f[3], f[4], f[5], f[6], f[7]].into_iter().filter(Option::is_some).collect();
+        // Exactly the constants the kernel expands string literals with (as in
+        // `deps::closure`): `String.ofList` where it exists (Lean 4.22 on, where
+        // `String.mk` is a later deprecated alias), otherwise `String.mk`. A
+        // missing one makes the literal fail in the kernel anyway, so it does
+        // not need a key.
+        let expand = f[2].or(f[3]);
+        let string = [f[1], expand, f[4], f[5], f[6], f[7]].into_iter().filter(Option::is_some).collect();
         Implicit { nat: f[0], string, eq: f[8] }
     }
 }

@@ -346,6 +346,17 @@ mod verdict_cache {
     }
 
     #[test]
+    fn string_literals_depend_on_the_expansion_function_only() {
+        // In Lean 4.36 `String.mk` is a deprecated alias declared after the
+        // first string literals; only `String.ofList` is an implicit dependency.
+        let src = include_str!("../../certus-kernel/tests/fixtures/string_literals.ndjson");
+        let (env, k) = keys(src);
+        for (i, key) in k.iter().enumerate() {
+            assert!(key.is_some(), "{} has no key", env.name_str(env.decls[i].primary_name()));
+        }
+    }
+
+    #[test]
     fn entries_are_checked() {
         let k = [42u8; 32];
         let e = cache::entry(&k);
