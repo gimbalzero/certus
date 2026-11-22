@@ -12,5 +12,6 @@ name = "certus"
 path = "src/main.rs"
 
 [dependencies]
+blake3.workspace = true
 certus-core = { path = "../certus-core" }
 certus-kernel = { path = "../certus-kernel" }
