@@ -2,7 +2,8 @@ name: Race
 
 # Runs benchmarks/race/race.py on a Linux runner against every checker we can
 # install, uploads the JSON, and fails if any checker rejects a valid
-# certificate or Certus accepts a tampered one.
+# certificate or Certus accepts a tampered one. Four rounds: the explicit and
+# the automated (simp/omega) proof, each as 1 theorem and as 1,000 copies.
 
 on:
   push:
