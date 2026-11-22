@@ -108,11 +108,22 @@ fn load(path: &str) -> Result<Env, String> {
 fn load_hashed(path: &str) -> Result<(Env, hash::Hash), String> {
     let t = Instant::now();
     let f = File::open(path).map_err(|e| format!("{path}: {e}"))?;
-    let mut r = BufReader::with_capacity(1 << 20, Tee { inner: f, h: blake3::Hasher::new() });
-    let env = parse(&mut r).map_err(|e| format!("{path}: {e}"))?;
+    // The bytes are hashed on their own thread, as they are read.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+    let hasher = std::thread::spawn(move || {
+        let mut h = blake3::Hasher::new();
+        for chunk in rx {
+            h.update(&chunk);
+        }
+        *h.finalize().as_bytes()
+    });
+    let mut r = BufReader::with_capacity(1 << 20, Tee { inner: f, tx });
+    let env = parse(&mut r).map_err(|e| format!("{path}: {e}"));
     // Hash whatever the parser did not need to read, too.
-    std::io::copy(&mut r, &mut std::io::sink()).map_err(|e| format!("{path}: {e}"))?;
-    let bytes = *r.into_inner().h.finalize().as_bytes();
+    let rest = std::io::copy(&mut r, &mut std::io::sink()).map_err(|e| format!("{path}: {e}"));
+    drop(r);
+    let bytes = hasher.join().map_err(|_| "the hashing thread panicked".to_string())?;
+    let (env, _) = (env?, rest?);
     let secs = t.elapsed().as_secs_f64();
     eprintln!(
         "parsed {} lines ({:.1} MB) in {:.2} s: {:.0} MB/s, {:.2}M records/s",
@@ -125,16 +136,18 @@ fn load_hashed(path: &str) -> Result<(Env, hash::Hash), String> {
     Ok((env, bytes))
 }
 
-/// A reader that hashes everything read through it.
+/// A reader that sends a copy of everything read through it to a hasher.
 struct Tee<R> {
     inner: R,
-    h: blake3::Hasher,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
 
 impl<R: Read> Read for Tee<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
-        self.h.update(&buf[..n]);
+        if n > 0 {
+            self.tx.send(buf[..n].to_vec()).map_err(|_| std::io::Error::other("the hashing thread stopped"))?;
+        }
         Ok(n)
     }
 }
