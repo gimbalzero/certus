@@ -665,7 +665,10 @@ impl Checker<'_, '_> {
         for (ti, t) in self.blk.types.iter().enumerate() {
             let s = self.tc.infer(t.ty, true)?;
             self.tc.ensure_sort(s)?;
-            let mut ty = t.ty;
+            // As in Lean's kernel, the type is put in weak head normal form
+            // before each binder, so it may reach its parameters and indices
+            // through definitions (`Presieve X := ∀ ⦃Y⦄, (Y ⟶ X) → Prop`).
+            let mut ty = self.tc.whnf(t.ty)?;
             let mut i = 0usize;
             let mut nidx = 0u32;
             let mut idx_fvars = Vec::new();
@@ -688,6 +691,7 @@ impl Checker<'_, '_> {
                     ty = self.st().instantiate_rev(b, &[x]);
                     nidx += 1;
                 }
+                ty = self.tc.whnf(ty)?;
                 i += 1;
             }
             if i < self.np {
@@ -958,7 +962,9 @@ impl Checker<'_, '_> {
         let mut indices: Vec<Vec<E>> = Vec::new();
         let mut majors = Vec::new();
         for t in &blk.types {
-            let mut ty = t.ty;
+            // Indices as Lean's `mk_rec_infos` finds them: from the type in weak
+            // head normal form before each binder (see `check_types`).
+            let mut ty = self.tc.whnf(t.ty)?;
             let mut i = 0usize;
             let mut idx = Vec::new();
             while let Node::Pi(d, b) = self.tc.st.node(ty) {
@@ -970,6 +976,7 @@ impl Checker<'_, '_> {
                     idx.push(x);
                     ty = self.st().instantiate_rev(b, &[x]);
                 }
+                ty = self.tc.whnf(ty)?;
                 i += 1;
             }
             let lv = self.levels.clone();

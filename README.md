@@ -8,7 +8,7 @@ Certus separates the two. **Search once, check forever.** The author's machine p
 
 The goal: **minutes on a laptop instead of days on a server**, and the best system on every one of the [44 axes](docs/SCOREBOARD.md) we track.
 
-> **Status: early Phase 1.** Certus has a working kernel: it type-checks Lean proofs from scratch, regenerates every recursor rather than trusting it, and beats Lean by 15–30× on our first benchmark. Nested inductive types and multi-core checking are next. See the [plan](docs/PLAN.md).
+> **Status: early Phase 1.** Certus has a working kernel: it type-checks Lean proofs from scratch, regenerates every recursor rather than trusting it, and beats Lean by 15–30× on our first benchmark. It supports nested inductive types; multi-core checking is next. See the [plan](docs/PLAN.md).
 
 ## The race
 
