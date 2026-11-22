@@ -136,11 +136,27 @@ fn rejects_unsafe_and_partial_definitions() {
 }
 
 #[test]
-fn native_arithmetic_survives_irrelevant_metadata() {
-    // Changing Nat.add's reducibility hint changes nothing the fingerprint
-    // covers, so native arithmetic stays on.
+fn native_arithmetic_needs_the_genuine_dependencies() {
+    // The fingerprint covers Nat.add's whole dependency closure, not only its
+    // own definition: changing a helper it unfolds through (even only its
+    // reducibility hint) turns native arithmetic off for Nat.add and for
+    // Nat.mul (which uses Nat.add), and the certificate is still accepted.
     let mut c = Cert::load();
-    let add = c.find("def", "Nat.add");
-    c.lines[add]["def"]["hints"] = serde_json::json!({"regular": 7});
+    let helper = c.find("def", "Nat.add.match_1");
+    c.lines[helper]["def"]["hints"] = serde_json::json!({"regular": 7});
+    assert_eq!(check(&c.text()).unwrap().native_nat_ops, 0);
+}
+
+#[test]
+fn native_arithmetic_ignores_binder_names() {
+    // Fingerprints are alpha-normal: renaming every binder keeps native arithmetic.
+    let mut c = Cert::load();
+    for r in &mut c.lines {
+        for k in ["lam", "forallE"] {
+            if let Some(b) = r.get_mut(k) {
+                b["binderInfo"] = Value::String("default".into());
+            }
+        }
+    }
     assert_eq!(check(&c.text()).unwrap().native_nat_ops, 2);
 }

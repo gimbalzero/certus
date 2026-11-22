@@ -36,7 +36,7 @@ cargo build --release
 
 Exports come from [`lean4export`](https://github.com/leanprover/lean4export) (format 3.x).
 
-- **A real kernel** (~2,800 lines of Rust). It checks types, definitions, theorems, inductive types (positivity, universes, and recursors rebuilt from scratch), and quotients. It also has proof irrelevance, eta and fast `Nat` arithmetic, which switches on only after it verifies `Nat` and each operation are the genuine ones. It rejects every tampered certificate in its test suite.
+- **A real kernel** (~2,800 lines of Rust). It checks types, definitions, theorems, inductive types (positivity, universes, and recursors rebuilt from scratch), and quotients. It also has proof irrelevance, eta and fast `Nat` arithmetic, which switches on for an operation only when it, and everything it depends on, matches the genuine definitions of a known Lean release (4.29.1 or 4.36.0) by content hash. It rejects every tampered certificate in its test suite.
 - **Strict reader.** It rejects unknown fields and record kinds, references to ids not yet defined, ids defined twice, duplicate declarations and malformed literals. Like Lean, it accepts sparse or out-of-order ids.
 - **Content hashes.** Every name, level, expression and declaration gets a BLAKE3 hash, as defined in the [certificate spec v0](docs/spec/certificate-v0.md). This is the basis for a cache that never needs trusting.
 - **Dependency closure and axiom audit.** It lists exactly which declarations and axioms a theorem rests on, and flags `sorryAx`, unsafe and partial definitions. Verified to match Lean's `#print axioms` on our benchmark.
