@@ -10,6 +10,7 @@ use certus_core::export::{self as ex, Decl, Env, NameId};
 use certus_core::{deps, hash};
 use num_bigint::BigUint;
 use rustc_hash::FxHashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -55,8 +56,17 @@ pub struct Report {
 
 struct Conv<'x> {
     ex: &'x Env,
-    exprs: Vec<Option<E>>,
+    /// The term of each export expression, once converted, as its id plus
+    /// one (`Option<NonZeroU32>` takes 4 bytes, `Option<E>` 8, and there
+    /// is one per expression of the export).
+    exprs: Vec<Option<NonZeroU32>>,
     levels: Vec<Option<L>>,
+}
+
+/// `e` as stored in `Conv::exprs`. Term ids are below `u32::MAX` (see
+/// `Store::mk`), so adding one cannot overflow.
+fn memo(e: E) -> Option<NonZeroU32> {
+    NonZeroU32::new(e.0 + 1)
 }
 
 impl Conv<'_> {
@@ -78,7 +88,7 @@ impl Conv<'_> {
 
     fn expr(&mut self, st: &mut Store, id: u32) -> R<E> {
         if let Some(e) = self.exprs[id as usize] {
-            return Ok(e);
+            return Ok(E(e.get() - 1));
         }
         let n = match &self.ex.exprs[id as usize] {
             ex::Expr::BVar(i) => Node::BVar(u32::try_from(*i).map_err(|_| "bound variable index too large")?),
@@ -96,12 +106,12 @@ impl Conv<'_> {
             ex::Expr::NatLit(s) => {
                 let v: BigUint = s.parse().map_err(|_| "malformed natural-number literal")?;
                 let e = st.nat(v);
-                self.exprs[id as usize] = Some(e);
+                self.exprs[id as usize] = memo(e);
                 return Ok(e);
             }
             ex::Expr::StrLit(s) => {
                 let e = st.str_lit(s);
-                self.exprs[id as usize] = Some(e);
+                self.exprs[id as usize] = memo(e);
                 return Ok(e);
             }
             ex::Expr::Proj { type_name, idx, structure } => Node::Proj(
@@ -111,7 +121,7 @@ impl Conv<'_> {
             ),
         };
         let e = st.mk(n);
-        self.exprs[id as usize] = Some(e);
+        self.exprs[id as usize] = memo(e);
         Ok(e)
     }
 }

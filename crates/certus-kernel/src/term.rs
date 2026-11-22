@@ -73,6 +73,36 @@ pub struct Info {
     pub has_lparam: bool,
 }
 
+fn node_hash(n: &Node) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one(n)
+}
+
+impl Tables {
+    /// Position of `n` in `nodes`, if it is there.
+    #[inline]
+    fn find(&self, n: &Node) -> Option<u32> {
+        self.map.find(node_hash(n), |&i| self.nodes[i as usize] == *n).copied()
+    }
+
+    /// Append `n`, which is not there yet, and index it.
+    fn push(&mut self, n: Node, info: Info) {
+        let i = u32::try_from(self.nodes.len()).expect("term store full");
+        self.nodes.push(n);
+        self.info.push(info);
+        let nodes = &self.nodes;
+        self.map.insert_unique(node_hash(&n), i, |&j| node_hash(&nodes[j as usize]));
+    }
+
+    /// Forget the index entry of the node at position `i`.
+    fn unindex(&mut self, i: u32) {
+        let n = self.nodes[i as usize];
+        if let Ok(entry) = self.map.find_entry(node_hash(&n), |&j| j == i) {
+            entry.remove();
+        }
+    }
+}
+
 /// End of a `nat_next` chain.
 const NO_NAT: u32 = u32::MAX;
 
@@ -81,7 +111,10 @@ const NO_NAT: u32 = u32::MAX;
 struct Tables {
     nodes: Vec<Node>,
     info: Vec<Info>,
-    map: FxHashMap<Node, E>,
+    /// Hash-consing index: the position in `nodes` of every node, found by
+    /// the node's hash and compared against `nodes`, so that each node is
+    /// stored once rather than again as a map key.
+    map: hashbrown::HashTable<u32>,
     levels: Vec<Level>,
     level_has_param: Vec<bool>,
     lmap: FxHashMap<Level, L>,
@@ -229,8 +262,8 @@ impl Store {
         keep.sort_unstable();
         let kept: Vec<(E, Node)> = keep.iter().map(|&x| (x, self.node(x))).collect();
         let from = (w.0 - self.nb) as usize;
-        for n in &self.own.nodes[from..] {
-            self.own.map.remove(n);
+        for i in from..self.own.nodes.len() {
+            self.own.unindex(i as u32);
         }
         self.own.nodes.truncate(from);
         self.own.info.truncate(from);
@@ -483,7 +516,7 @@ impl Store {
             Node::Str(i) => i < self.strb,
             Node::Proj(_, _, x) => b(x),
         };
-        if parts_in_base { self.base.map.get(&n).copied() } else { None }
+        if parts_in_base { self.base.find(&n).map(E) } else { None }
     }
 
     pub fn mk(&mut self, n: Node) -> E {
@@ -492,15 +525,14 @@ impl Store {
         {
             return e;
         }
-        if let Some(&e) = self.own.map.get(&n) {
-            return e;
+        if let Some(i) = self.own.find(&n) {
+            return E(self.nb + i);
         }
         let info = self.node_info(n);
         let id = self.nb as usize + self.own.nodes.len();
-        let e = E(u32::try_from(id).expect("term store full"));
-        self.own.nodes.push(n);
-        self.own.info.push(info);
-        self.own.map.insert(n, e);
+        // Ids stay below `u32::MAX`, so that `id + 1` fits too.
+        let e = E(u32::try_from(id).ok().filter(|&i| i < u32::MAX).expect("term store full"));
+        self.own.push(n, info);
         e
     }
 
