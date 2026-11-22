@@ -20,5 +20,5 @@ pub mod quot;
 pub mod tc;
 pub mod term;
 
-pub use check::{CheckError, Report, check};
+pub use check::{CheckError, Report, check, check_jobs};
 pub use tc::KError;

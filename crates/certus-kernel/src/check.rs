@@ -11,6 +11,7 @@ use certus_core::{deps, hash};
 use num_bigint::BigUint;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -46,6 +47,8 @@ pub struct Report {
     pub term_nodes: usize,
     /// Nat operations verified as genuine and computed natively.
     pub native_nat_ops: usize,
+    /// Worker threads used.
+    pub threads: usize,
 }
 
 struct Conv<'x> {
@@ -111,64 +114,160 @@ impl Conv<'_> {
     }
 }
 
-/// Check the declarations at indices `decls` (ascending file order). Every
-/// dependency must be in the list: anything missing is reported as an
-/// unknown constant, never assumed.
+/// Check the declarations at indices `decls` (ascending file order) on one
+/// thread. Every dependency must be in the list: anything missing is reported
+/// as an unknown constant, never assumed.
 ///
 /// Checking runs on a dedicated thread with a large stack (`STACK_SIZE`), so
 /// deeply nested terms and definitional-equality checks work the same for
 /// every caller. Running short of that stack is a resource error, not a crash.
 pub fn check(env: &Env, decls: &[usize]) -> Result<Report, CheckError> {
-    std::thread::scope(|s| {
-        let worker = std::thread::Builder::new()
-            .name("certus-check".into())
-            .stack_size(STACK_SIZE)
-            .spawn_scoped(s, || check_on_this_thread(env, decls))
-            .map_err(|e| CheckError {
-                decl: String::new(),
-                msg: format!("cannot start the checker thread: {e}"),
-                resource: true,
-            })?;
-        worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
+    check_jobs(env, decls, 1)
+}
+
+/// [`check`] on `jobs` threads, with exactly the same verdict.
+///
+/// Every worker walks the whole list in file order with its own term store,
+/// so each builds exactly the environment the sequential checker would
+/// build. A worker *claims* each definition, theorem, opaque or axiom before
+/// it reaches it, and type-checks only the ones it claimed. The others it
+/// only *admits*: it runs every check that does not need the type checker
+/// (safety, universe parameters, conversion) and adds them as they are.
+/// Inductive types and quotients are cheap, and their recursors and rules
+/// must be built by each worker, so every worker checks them in full. So
+/// each declaration is type-checked exactly once, by whichever worker got
+/// there first.
+///
+/// Verdict: the failure at the earliest position, as in sequential checking.
+/// Everything before the first failure passes, so the worker that checks it
+/// sees the same environment as the sequential checker would, and reaches the
+/// same verdict. Declarations admitted by other workers may still be
+/// unchecked when used, but a failure at a later position is never
+/// reported ahead of an earlier one. Once a failure is known, workers stop
+/// at that position.
+pub fn check_jobs(env: &Env, decls: &[usize], jobs: usize) -> Result<Report, CheckError> {
+    let start = Instant::now();
+    let prep = Prep::new(env);
+    let jobs = jobs.clamp(1, decls.len().max(1));
+    let shared = Shared {
+        claimed: (0..decls.len()).map(|_| AtomicBool::new(false)).collect(),
+        first_failure: AtomicUsize::new(usize::MAX),
+        parallel: jobs > 1,
+    };
+    let outs: Vec<Worker> = std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for w in 0..jobs {
+            let (prep, shared) = (&prep, &shared);
+            let h = std::thread::Builder::new()
+                .name(format!("certus-check-{w}"))
+                .stack_size(STACK_SIZE)
+                .spawn_scoped(s, move || run_worker(env, decls, prep, shared));
+            match h {
+                Ok(h) => handles.push(h),
+                // Fewer threads are fine (every declaration is still checked
+                // by someone), but at least one is needed.
+                Err(e) if handles.is_empty() => {
+                    return Err(CheckError {
+                        decl: String::new(),
+                        msg: format!("cannot start the checker thread: {e}"),
+                        resource: true,
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(handles.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect())
+    })?;
+
+    if let Some((_, e)) = outs.iter().filter_map(|w| w.failure.as_ref()).min_by_key(|(pos, _)| *pos) {
+        return Err(CheckError { decl: e.decl.clone(), msg: e.msg.clone(), resource: e.resource });
+    }
+    let mut times: Vec<(usize, Duration)> = outs.iter().flat_map(|w| w.times.iter().copied()).collect();
+    times.sort_by_key(|a| std::cmp::Reverse(a.1));
+    let first = &outs[0];
+    Ok(Report {
+        checked: decls.len(),
+        by_kind: first.by_kind.clone(),
+        time: start.elapsed(),
+        slowest: times
+            .iter()
+            .take(5)
+            .map(|&(i, t)| (prep.strs[env.decls[i].primary_name() as usize].clone(), t))
+            .collect(),
+        term_nodes: outs.iter().map(|w| w.term_nodes).sum(),
+        native_nat_ops: first.native_nat_ops,
+        threads: outs.len(),
     })
 }
 
-fn check_on_this_thread(env: &Env, decls: &[usize]) -> Result<Report, CheckError> {
-    crate::tc::set_stack_base();
-    let start = Instant::now();
-    let mut st = Store::new();
-    let mut kenv = KEnv::default();
+/// Name strings and builtin candidates, computed once and shared by all workers.
+struct Prep {
+    strs: Vec<String>,
+    candidates: Builtins,
+}
 
-    // Resolve the names the kernel treats specially.
-    let mut strs: Vec<String> = Vec::with_capacity(env.names.len());
-    for n in &env.names {
-        let s = match n {
-            ex::Name::Anon => String::new(),
-            ex::Name::Str { pre, s } => join(&strs[*pre as usize], s),
-            ex::Name::Num { pre, n } => join(&strs[*pre as usize], &n.to_string()),
-        };
-        strs.push(s);
-    }
-    let mut by_str: FxHashMap<&str, NameId> = FxHashMap::default();
-    for (i, s) in strs.iter().enumerate() {
-        if env.name_canon[i] as usize == i {
-            by_str.entry(s.as_str()).or_insert(i as NameId);
+impl Prep {
+    fn new(env: &Env) -> Self {
+        // Resolve the names the kernel treats specially.
+        let mut strs: Vec<String> = Vec::with_capacity(env.names.len());
+        for n in &env.names {
+            let s = match n {
+                ex::Name::Anon => String::new(),
+                ex::Name::Str { pre, s } => join(&strs[*pre as usize], s),
+                ex::Name::Num { pre, n } => join(&strs[*pre as usize], &n.to_string()),
+            };
+            strs.push(s);
         }
+        let mut by_str: FxHashMap<&str, NameId> = FxHashMap::default();
+        for (i, s) in strs.iter().enumerate() {
+            if env.name_canon[i] as usize == i {
+                by_str.entry(s.as_str()).or_insert(i as NameId);
+            }
+        }
+        // Native Nat arithmetic is only switched on once `Nat` and each operation
+        // have been checked to be the genuine ones (see `activate_nat`).
+        let mut candidates = Builtins::resolve(|s| by_str.get(s).copied());
+        // Lean 4.22 on expands string literals with `String.ofList` (`String.mk`
+        // became a deprecated alias); earlier versions with the constructor `String.mk`.
+        if let Some(n) = candidates.string_of_list
+            && env.decl_of_name.contains_key(&n)
+        {
+            candidates.string_mk = Some(n);
+        }
+        drop(by_str);
+        Prep { strs, candidates }
     }
-    // Native Nat arithmetic is only switched on once `Nat` and each operation
-    // have been checked to be the genuine ones (see `activate_nat`).
-    let mut candidates = Builtins::resolve(|s| by_str.get(s).copied());
-    // Lean 4.22 on expands string literals with `String.ofList` (`String.mk`
-    // became a deprecated alias); earlier versions with the constructor `String.mk`.
-    if let Some(n) = candidates.string_of_list
-        && env.decl_of_name.contains_key(&n)
-    {
-        candidates.string_mk = Some(n);
-    }
-    // Likewise string literals are only typed and expanded once `String`,
-    // `String.mk`, `Char`, `Char.ofNat`, `List.nil` and `List.cons` have been
-    // checked to have their standard shapes (see `activate_string`).
-    kenv.builtins = Builtins {
+}
+
+/// State shared by the workers of one `check_jobs` call.
+struct Shared {
+    /// `claimed[p]`: some worker type-checks the declaration at position `p`.
+    claimed: Vec<AtomicBool>,
+    /// Earliest position known to fail (`usize::MAX`: none yet).
+    first_failure: AtomicUsize,
+    parallel: bool,
+}
+
+/// What one worker found.
+struct Worker {
+    /// Position in `decls` and error of the first failure this worker met.
+    failure: Option<(usize, CheckError)>,
+    /// Time spent on each declaration this worker type-checked.
+    times: Vec<(usize, Duration)>,
+    by_kind: Vec<(&'static str, usize)>,
+    term_nodes: usize,
+    native_nat_ops: usize,
+}
+
+fn run_worker(env: &Env, decls: &[usize], prep: &Prep, shared: &Shared) -> Worker {
+    crate::tc::set_stack_base();
+    let strs = &prep.strs;
+    let candidates = &prep.candidates;
+    let mut st = Store::new();
+    // Nat arithmetic and string literals are only switched on once the
+    // constants they rely on have been checked (see `activate_nat` and
+    // `activate_string`).
+    let builtins = Builtins {
         nat: None,
         nat_zero: None,
         nat_succ: None,
@@ -182,42 +281,65 @@ fn check_on_this_thread(env: &Env, decls: &[usize]) -> Result<Report, CheckError
         list_cons: None,
         ..candidates.clone()
     };
+    let mut kenv = KEnv { builtins, ..KEnv::default() };
 
     let mut conv = Conv { ex: env, exprs: vec![None; env.exprs.len()], levels: vec![None; env.levels.len()] };
     let mut counts: FxHashMap<&'static str, usize> = FxHashMap::default();
     let mut hashes: Option<hash::LazyHashes> = None;
     let mut times: Vec<(usize, Duration)> = Vec::new();
+    let mut failure = None;
 
-    for &i in decls {
+    for (pos, &i) in decls.iter().enumerate() {
+        if pos > shared.first_failure.load(Ordering::Relaxed) {
+            break;
+        }
         let d = &env.decls[i];
+        let mode = match d {
+            Decl::Inductive(_) | Decl::Quot(_) => Mode::Check,
+            _ if !shared.parallel || !shared.claimed[pos].swap(true, Ordering::Relaxed) => Mode::Check,
+            _ => Mode::Admit,
+        };
         let t0 = Instant::now();
         let name = || strs[d.primary_name() as usize].clone();
-        let new = check_decl(&mut st, &kenv, &mut conv, env, d).map_err(|e| CheckError::new(name(), e))?;
-        let added: Vec<NameId> = new.iter().map(|(n, _)| *n).collect();
-        for (n, info) in new {
-            if kenv.consts.insert(n, Arc::new(info)).is_some() {
-                return Err(CheckError { decl: name(), msg: "constant declared twice".into(), resource: false });
+        let new = match check_decl(&mut st, &kenv, &mut conv, env, d, mode) {
+            Ok(new) => new,
+            Err(e) => {
+                failure = Some((pos, CheckError::new(name(), e)));
+                break;
             }
+        };
+        let added: Vec<NameId> = new.iter().map(|(n, _)| *n).collect();
+        let mut twice = false;
+        for (n, info) in new {
+            twice |= kenv.consts.insert(n, Arc::new(info)).is_some();
+        }
+        if twice {
+            failure = Some((pos, CheckError { decl: name(), msg: "constant declared twice".into(), resource: false }));
+            break;
         }
         for n in added {
-            activate_nat(&mut st, &mut kenv, &candidates, n, &strs, env, &mut hashes);
-            activate_string(&mut st, &mut kenv, &candidates, n);
+            activate_nat(&mut st, &mut kenv, candidates, n, strs, env, &mut hashes);
+            activate_string(&mut st, &mut kenv, candidates, n);
         }
         *counts.entry(d.kind()).or_default() += 1;
-        times.push((i, t0.elapsed()));
+        if mode == Mode::Check {
+            times.push((i, t0.elapsed()));
+        }
+    }
+    if let Some((pos, _)) = &failure {
+        shared.first_failure.fetch_min(*pos, Ordering::Relaxed);
     }
 
-    times.sort_by_key(|a| std::cmp::Reverse(a.1));
     let mut by_kind: Vec<(&'static str, usize)> = counts.into_iter().collect();
     by_kind.sort();
-    Ok(Report {
-        checked: decls.len(),
-        by_kind,
-        time: start.elapsed(),
-        slowest: times.iter().take(5).map(|&(i, t)| (strs[env.decls[i].primary_name() as usize].clone(), t)).collect(),
-        term_nodes: st.num_nodes(),
-        native_nat_ops: kenv.builtins.nat_ops.len(),
-    })
+    Worker { failure, times, by_kind, term_nodes: st.num_nodes(), native_nat_ops: kenv.builtins.nat_ops.len() }
+}
+
+/// Whether a worker type-checks a declaration or only admits it (see `check_jobs`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Check,
+    Admit,
 }
 
 /// Fingerprints of the genuine `Nat` operations the kernel computes natively,
@@ -500,7 +622,17 @@ fn check_value(tc: &mut TC, val: E, ty: E) -> R<()> {
     Ok(())
 }
 
-fn check_decl(st: &mut Store, kenv: &KEnv, conv: &mut Conv, env: &Env, d: &Decl) -> R<Vec<(NameId, ConstInfo)>> {
+/// Check one declaration and return the constants it adds. With
+/// `Mode::Admit`, everything except the type checker runs (see `check_jobs`).
+fn check_decl(
+    st: &mut Store,
+    kenv: &KEnv,
+    conv: &mut Conv,
+    env: &Env,
+    d: &Decl,
+    mode: Mode,
+) -> R<Vec<(NameId, ConstInfo)>> {
+    let check = mode == Mode::Check;
     for n in d.defined_names() {
         if kenv.consts.contains_key(&n) {
             return Err("constant declared twice".into());
@@ -514,8 +646,10 @@ fn check_decl(st: &mut Store, kenv: &KEnv, conv: &mut Conv, env: &Env, d: &Decl)
             }
             distinct(&a.level_params)?;
             let ty = conv.expr(st, a.r#type)?;
-            let mut tc = TC::new(st, kenv, a.level_params.clone());
-            check_type(&mut tc, ty)?;
+            if check {
+                let mut tc = TC::new(st, kenv, a.level_params.clone());
+                check_type(&mut tc, ty)?;
+            }
             vec![(a.name, info(&a.level_params, ty, Kind::Axiom))]
         }
         Decl::Def(a) => {
@@ -526,21 +660,25 @@ fn check_decl(st: &mut Store, kenv: &KEnv, conv: &mut Conv, env: &Env, d: &Decl)
             let hints = hints_of(&a.hints)?;
             let ty = conv.expr(st, a.r#type)?;
             let val = conv.expr(st, a.value)?;
-            let mut tc = TC::new(st, kenv, a.level_params.clone());
-            check_type(&mut tc, ty)?;
-            check_value(&mut tc, val, ty)?;
+            if check {
+                let mut tc = TC::new(st, kenv, a.level_params.clone());
+                check_type(&mut tc, ty)?;
+                check_value(&mut tc, val, ty)?;
+            }
             vec![(a.name, info(&a.level_params, ty, Kind::Def { val, hints }))]
         }
         Decl::Thm(a) => {
             distinct(&a.level_params)?;
             let ty = conv.expr(st, a.r#type)?;
             let val = conv.expr(st, a.value)?;
-            let mut tc = TC::new(st, kenv, a.level_params.clone());
-            let l = check_type(&mut tc, ty)?;
-            if !tc.st.is_zero(l) {
-                return Err("theorem type is not a proposition".into());
+            if check {
+                let mut tc = TC::new(st, kenv, a.level_params.clone());
+                let l = check_type(&mut tc, ty)?;
+                if !tc.st.is_zero(l) {
+                    return Err("theorem type is not a proposition".into());
+                }
+                check_value(&mut tc, val, ty)?;
             }
-            check_value(&mut tc, val, ty)?;
             vec![(a.name, info(&a.level_params, ty, Kind::Thm { val }))]
         }
         Decl::Opaque(a) => {
@@ -550,9 +688,11 @@ fn check_decl(st: &mut Store, kenv: &KEnv, conv: &mut Conv, env: &Env, d: &Decl)
             distinct(&a.level_params)?;
             let ty = conv.expr(st, a.r#type)?;
             let val = conv.expr(st, a.value)?;
-            let mut tc = TC::new(st, kenv, a.level_params.clone());
-            check_type(&mut tc, ty)?;
-            check_value(&mut tc, val, ty)?;
+            if check {
+                let mut tc = TC::new(st, kenv, a.level_params.clone());
+                check_type(&mut tc, ty)?;
+                check_value(&mut tc, val, ty)?;
+            }
             vec![(a.name, info(&a.level_params, ty, Kind::Opaque))]
         }
         Decl::Quot(a) => {
