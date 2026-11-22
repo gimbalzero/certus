@@ -14,7 +14,17 @@ fn check(text: &str) -> Result<certus_kernel::Report, String> {
     let env = parse(text.as_bytes()).map_err(|e| e.to_string())?;
     let root = env.find_decl(THM).ok_or("theorem missing")?;
     let closure = deps::closure(&env, &[root]);
-    certus_kernel::check(&env, &closure.decls).map_err(|e| e.to_string())
+    let one = certus_kernel::check(&env, &closure.decls).map_err(|e| e.to_string());
+    // Multi-core checking must reach exactly the same verdict.
+    for jobs in [2, 3, 8] {
+        let many = certus_kernel::check_jobs(&env, &closure.decls, jobs).map_err(|e| e.to_string());
+        match (&one, &many) {
+            (Ok(a), Ok(b)) => assert_eq!((a.checked, a.native_nat_ops), (b.checked, b.native_nat_ops)),
+            (Err(a), Err(b)) => assert_eq!(a, b, "--jobs {jobs} gave a different error"),
+            _ => panic!("--jobs {jobs} gave a different verdict: {:?} vs {:?}", one.is_ok(), many.is_ok()),
+        }
+    }
+    one
 }
 
 /// The certificate as JSON records, with a way to find declarations by name.
@@ -159,4 +169,23 @@ fn native_arithmetic_ignores_binder_names() {
         }
     }
     assert_eq!(check(&c.text()).unwrap().native_nat_ops, 2);
+}
+
+#[test]
+fn parallel_checking_reports_the_earliest_failure() {
+    // Break two theorems: the verdict names the one earlier in the file,
+    // whichever thread finds it, as sequential checking does.
+    let mut c = Cert::load();
+    let (a, b) = (c.find("thm", "Nat.add_comm"), c.find("thm", THM));
+    let other = c.find("thm", "Nat.mul_comm");
+    c.lines[a]["thm"]["value"] = c.lines[other]["thm"]["value"].clone();
+    c.lines[b]["thm"]["value"] = c.lines[other]["thm"]["value"].clone();
+    let text = c.text();
+    let env = parse(text.as_bytes()).unwrap();
+    let all: Vec<usize> = (0..env.decls.len()).collect();
+    let first = certus_kernel::check(&env, &all).unwrap_err().to_string();
+    assert!(first.starts_with("Nat.add_comm"), "{first}");
+    for jobs in 1..=8 {
+        assert_eq!(certus_kernel::check_jobs(&env, &all, jobs).unwrap_err().to_string(), first);
+    }
 }

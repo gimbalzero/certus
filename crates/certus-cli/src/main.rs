@@ -25,9 +25,11 @@ USAGE:
         of a constant. --raw shows every argument, instance and universe level
         instead of notation such as `a + b`.
 
-    certus check <export.ndjson> [<Decl.Name>...]
+    certus check <export.ndjson> [<Decl.Name>...] [--jobs N]
         Type-check declarations with the Certus kernel. With names, check
         exactly what those declarations depend on; without, check everything.
+        --jobs N: use N threads (default: all cores); the verdict is the same
+        for every N.
         Exit code 0: all accepted; 1: REJECTED (invalid) or other error;
         2: DECLINED (ran out of work budget or stack before a verdict).
     certus extract <export.ndjson> <out.ndjson> <Decl.Name>...
@@ -251,7 +253,23 @@ fn resolve(env: &Env, names: &[String]) -> Result<Vec<usize>, String> {
 
 /// `Err` is a failure (including `REJECTED`); `Ok(Err(_))` means the kernel
 /// declined: it ran out of resources before reaching a verdict.
-fn check_cmd(path: &str, names: &[String]) -> Result<Result<(), String>, String> {
+fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--jobs" || a == "-j" {
+            let n = it.next().ok_or("--jobs needs a number")?;
+            jobs = n
+                .parse()
+                .ok()
+                .filter(|&n: &usize| n > 0)
+                .ok_or_else(|| format!("--jobs: not a positive number: {n}"))?;
+        } else {
+            names.push(a.clone());
+        }
+    }
+    let names = &names[..];
     let env = load(path)?;
     let decls: Vec<usize> = if names.is_empty() {
         (0..env.decls.len()).collect()
@@ -259,13 +277,20 @@ fn check_cmd(path: &str, names: &[String]) -> Result<Result<(), String>, String>
         let roots = resolve(&env, names)?;
         deps::closure(&env, &roots).decls
     };
-    let r = match certus_kernel::check(&env, &decls) {
+    let r = match certus_kernel::check_jobs(&env, &decls, jobs) {
         Ok(r) => r,
         Err(e) if e.resource => return Ok(Err(format!("DECLINED {e} (no verdict: out of resources)"))),
         Err(e) => return Err(format!("REJECTED {e}")),
     };
     let kinds: Vec<String> = r.by_kind.iter().map(|(k, n)| format!("{n} {k}")).collect();
-    println!("OK: {} declarations type-checked in {:.3} s ({})", r.checked, r.time.as_secs_f64(), kinds.join(", "));
+    println!(
+        "OK: {} declarations type-checked in {:.3} s on {} thread{} ({})",
+        r.checked,
+        r.time.as_secs_f64(),
+        r.threads,
+        if r.threads == 1 { "" } else { "s" },
+        kinds.join(", ")
+    );
     println!("term nodes: {}; Nat operations verified for native arithmetic: {}", r.term_nodes, r.native_nat_ops);
     for (n, t) in &r.slowest {
         println!("  {:>9.3} ms  {n}", t.as_secs_f64() * 1e3);
