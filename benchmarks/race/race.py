@@ -9,7 +9,7 @@ Needs, on PATH: lean and leanexport (to make the certificates), and a release
 build of certus (`cargo build --release` at the repo root).
 
 Optional contestants, skipped with a note when missing (unless --require
-names them): leanchecker, nanoda_bin, con-leche, and Metamath (an executable
+names them): leanchecker, lean4lean, nanoda_bin, con-leche, and Metamath (an executable
 and set.mm in ../proof-bench/metamath, see ../proof-bench/bench.sh).
 
 Round 1: 2·(0+1+…+n) = n(n+1), one theorem, explicit proof (named rewrites).
@@ -46,7 +46,7 @@ THM1 = "sum_formula_explicit"
 THM_AUTO = "sum_formula_auto"
 
 # Tool names accepted by --require.
-OPTIONAL_TOOLS = ["leanchecker", "nanoda", "con-leche", "metamath"]
+OPTIONAL_TOOLS = ["leanchecker", "lean4lean", "nanoda", "con-leche", "metamath"]
 
 
 def sh(cmd, cwd=None, env=None):
@@ -274,6 +274,7 @@ def main():
     # Optional tool -> (available?, why not).
     tools = {
         "leanchecker": (have("leanchecker"), "leanchecker not on PATH"),
+        "lean4lean": (have("lean4lean"), "lean4lean not on PATH"),
         "nanoda": (have("nanoda_bin"), "nanoda_bin not on PATH"),
         "con-leche": (have("con-leche"), "con-leche not on PATH"),
         "metamath": (metamath_ok, f"no metamath + set.mm in {MM_DIR} (see proof-bench/bench.sh)"),
@@ -287,6 +288,9 @@ def main():
             ("con-leche", "con-leche (certificate)", ["con-leche", cert1], None, ok_leche),
             ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", "Sum"], LEAN_DIR,
              ok_any),
+            ("lean4lean", "Lean4Lean, trusts imports", ["lean4lean", "Sum"], LEAN_DIR, ok_any),
+            ("lean4lean", "Lean4Lean --fresh, re-checks the module and all of its imports",
+             ["lean4lean", "--fresh", "Sum"], LEAN_DIR, ok_any),
             ("lean", "Lean, build from source", ["lean", "Sum.lean"], LEAN_DIR, ok_any),
         ],
         "1,000 theorems": [
@@ -295,6 +299,9 @@ def main():
             ("con-leche", "con-leche (certificate)", ["con-leche", cert2], None, ok_leche),
             ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", gen2],
              LEAN_DIR, ok_any),
+            ("lean4lean", "Lean4Lean, trusts imports", ["lean4lean", gen2], LEAN_DIR, ok_any),
+            ("lean4lean", "Lean4Lean --fresh, re-checks the module and all of its imports",
+             ["lean4lean", "--fresh", gen2], LEAN_DIR, ok_any),
             ("lean", "Lean, build from source", ["lean", f"{gen2}.lean"], LEAN_DIR, ok_any),
             ("metamath", "Metamath: all of set.mm (48k theorems)",
              ["./metamath", "set scroll continuous", "read set.mm", "verify proof *", "exit"], MM_DIR, ok_mm),
@@ -307,6 +314,9 @@ def main():
             ("con-leche", "con-leche (certificate)", ["con-leche", cert3], None, ok_leche),
             ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", "Sum"], LEAN_DIR,
              ok_any),
+            ("lean4lean", "Lean4Lean, trusts imports", ["lean4lean", "Sum"], LEAN_DIR, ok_any),
+            ("lean4lean", "Lean4Lean --fresh, re-checks the module and all of its imports",
+             ["lean4lean", "--fresh", "Sum"], LEAN_DIR, ok_any),
             ("lean", "Lean, build from source", ["lean", "Sum.lean"], LEAN_DIR, ok_any),
         ],
         # Metamath is a whole-library reference, not a check of this proof, so
@@ -317,6 +327,9 @@ def main():
             ("con-leche", "con-leche (certificate)", ["con-leche", cert4], None, ok_leche),
             ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", gen4],
              LEAN_DIR, ok_any),
+            ("lean4lean", "Lean4Lean, trusts imports", ["lean4lean", gen4], LEAN_DIR, ok_any),
+            ("lean4lean", "Lean4Lean --fresh, re-checks the module and all of its imports",
+             ["lean4lean", "--fresh", gen4], LEAN_DIR, ok_any),
             ("lean", "Lean, build from source", ["lean", f"{gen4}.lean"], LEAN_DIR, ok_any),
         ],
     }
@@ -347,7 +360,8 @@ def main():
                 rows.append({"checker": name, "tool": tool, "skipped": skipped[tool]})
                 print(f"| {name} | skipped | {skipped[tool]} |", flush=True)
                 continue
-            runs = min(args.runs, 2) if "from source" in name and "1,000" in rnd else args.runs
+            slow = ("from source" in name and "1,000" in rnd) or "--fresh" in name
+            runs = min(args.runs, 2) if slow else args.runs
             best, out = timed(cmd, cwd, env, runs, check)
             if best is None:
                 failures.append(f"{name} rejected the valid input in round '{rnd}'")

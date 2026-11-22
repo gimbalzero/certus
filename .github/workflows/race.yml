@@ -27,6 +27,8 @@ env:
   LEAN4EXPORT_REV: df81913eee5519d5a88ae5b0fd701b5298cc29ab
   NANODA_REV: 0da9f98feadd3a0a2ef4b3dbcf52a298a6fef929
   CONLECHE_REV: 5ea446d5c79d23ef1f954215d094db2162f1ab6f
+  # digama0/lean4lean master on 22 Nov 2026, the first to target Lean v4.36.0.
+  LEAN4LEAN_REV: 23fd0341e823a332ce5df21a1897c8afcbf34471
   METAMATH_REV: 580b4bd5ae6f2a0d746398b0033cddccba1b418b
   SETMM_REV: 844c01282c43f4ed03a8d302f19cd971a3a2be8c
 
@@ -57,8 +59,9 @@ jobs:
           path: |
             ~/tools/lean4export/.lake
             ~/tools/con-leche/.lake
+            ~/tools/lean4lean/.lake
             ~/tools/cargo
-          key: race-tools-${{ runner.os }}-${{ env.LEAN_TOOLCHAIN }}-${{ env.LEAN4EXPORT_REV }}-${{ env.CONLECHE_REV }}-${{ env.NANODA_REV }}
+          key: race-tools-${{ runner.os }}-${{ env.LEAN_TOOLCHAIN }}-${{ env.LEAN4EXPORT_REV }}-${{ env.CONLECHE_REV }}-${{ env.LEAN4LEAN_REV }}-${{ env.NANODA_REV }}
 
       - name: lean4export (from source)
         run: |
@@ -92,6 +95,18 @@ jobs:
           lake build con-leche
           ln -sf "$d/.lake/build/bin/con-leche" "$HOME/race-bin/con-leche"
 
+      - name: Lean4Lean (from source)
+        run: |
+          set -euo pipefail
+          d="$HOME/tools/lean4lean"
+          mkdir -p "$d" && cd "$d"
+          [ -d .git ] || git init -q
+          git fetch -q --depth 1 https://github.com/digama0/lean4lean "$LEAN4LEAN_REV"
+          git checkout -q -f FETCH_HEAD
+          test "$(cat lean-toolchain)" = "$LEAN_TOOLCHAIN"
+          lake build lean4lean
+          ln -sf "$d/.lake/build/bin/lean4lean" "$HOME/race-bin/lean4lean"
+
       - name: Metamath and set.mm
         run: |
           set -euo pipefail
@@ -104,7 +119,7 @@ jobs:
 
       - name: Tool versions
         run: |
-          which lean leanexport leanchecker nanoda_bin con-leche
+          which lean leanexport leanchecker lean4lean nanoda_bin con-leche
           lean --version
 
       - name: Build Certus

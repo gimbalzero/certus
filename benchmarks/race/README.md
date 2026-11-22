@@ -63,7 +63,24 @@ induction n with
 | Lean kernel replay (`leanchecker`) | 10,247 ms | 10,245 ms | 6,307 ms | 2.7× faster |
 | Lean, build from source | 27,993 ms | 66,761 ms | 9,039 ms | 1× |
 
-The Apple M2 column for Certus is a local run of `race.py --runs 5` with multi-core checking (8 threads), 22 Nov 2026. In that run nanoda took 1,114 ms on round 4 and 57 ms on round 3. With the kernel speed-ups of [#22](https://github.com/gimbalzero/certus/issues/22) as well, round 4 takes 0.83 s on 8 threads. The CI columns are still single-threaded Certus and will update on the next CI run.
+The Apple M2 column for Certus is a local run of `race.py --runs 5` with multi-core checking (8 threads), 22 Nov 2026. In that run nanoda took 1,114 ms on round 4 and 57 ms on round 3. With the kernel speed-ups of [#22](https://github.com/gimbalzero/certus/issues/22) as well, round 4 takes 0.83 s on 8 threads. The CI columns above are from before multi-core checking; the next section has a newer CI run in which Certus uses all 4 cores.
+
+## Latest CI run, with Lean4Lean
+
+All four rounds in one CI run on `ubuntu-latest` (4 cores), [run 45078778037](https://github.com/gimbalzero/certus/actions/runs/45078778037), 22 Nov 2026, best of 5 runs (2 for the slow rows). Certus and the other checkers use every core. [Lean4Lean](https://github.com/digama0/lean4lean), the Lean kernel ported to Lean, is built from source at `23fd034`, the first commit that targets Lean 4.36. It runs two ways: trusting the imports, like `leanchecker`, and with `--fresh`, which re-checks the module and everything it imports, all of `Init` included.
+
+| Checker | Round 1 | Round 2 | Round 3 | Round 4 |
+|---|---|---|---|---|
+| **Certus** (certificate) | **4 ms** | **72 ms** | **64 ms** | **1,264 ms** |
+| nanoda (certificate) | 4 ms | 133 ms | 71 ms | 2,128 ms |
+| con-leche (certificate) | 11 ms | 200 ms | 106 ms | 2,396 ms |
+| Lean kernel replay (`leanchecker`), trusts imports | 232 ms | 820 ms | 222 ms | 7,763 ms |
+| Lean4Lean, trusts imports | 229 ms | 1,094 ms | 216 ms | 12,628 ms |
+| Lean4Lean `--fresh`, re-checks all imports | 63,566 ms | 64,348 ms | 63,288 ms | 76,098 ms |
+| Lean, build from source | 143 ms | 6,444 ms | 141 ms | 18,331 ms |
+| *Metamath, all of set.mm, for scale* | | *4,883 ms* | | |
+
+In this run, Certus is the fastest checker in every round: it ties nanoda on round 1 and is 1.7× faster on round 4. It also rejected all seven tampered certificates. Lean4Lean `--fresh` checks much more than the certificate checkers, since it re-checks every module the file imports, not only the declarations the theorems depend on, so its row shows the cost of a fresh check rather than a like-for-like time.
 
 The CI run's explicit rounds, for comparison: round 1 Certus 8 ms, nanoda 6 ms, con-leche 15 ms, Lean build 247 ms; round 2 Certus 301 ms, nanoda 181 ms, con-leche 287 ms, `leanchecker` 1,220 ms, Lean build 10,054 ms, Metamath 6,390 ms.
 
