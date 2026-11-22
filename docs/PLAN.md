@@ -26,7 +26,7 @@ The goal is to be the best proof-checking system on all 44 axes in [SCOREBOARD.m
 - [ ] **E1 and E2 on Mathlib**, on a rented 32–64 core machine
 - **Done when** the scoreboard has measured baselines and E1/E2 have settled H1.
 
-### Phase 1: The fastest checker (now)
+### Phase 1: The fastest checker (targets met; next: post on the Lean Zulip)
 - [x] Rust type checker for the Lean kernel: inference, reduction, definitional equality, inductive types with regenerated recursors, quotients, verified-only native `Nat` arithmetic
 - [x] `certus extract`: minimal certificates; race against Lean, nanoda, con-leche ([results](../benchmarks/race))
 - [x] Tamper suite: wrong proof, changed statement, missing dependency, forged recursor, data as theorem, injected field, partial definition
