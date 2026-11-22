@@ -110,6 +110,27 @@ pub fn keys(env: &Env, checker: &[u8; 32]) -> Vec<Option<Hash>> {
     keys
 }
 
+/// Derive-key context of a whole-export key.
+pub const EXPORT_CONTEXT: &str = "certus verdict cache v1 2026-11-22 export key";
+
+/// Key of a whole check: the checker build, the BLAKE3 hash of the export's
+/// exact bytes, and the declarations asked for (none: all of them). The same
+/// bytes checked by the same build for the same targets always get the same
+/// verdict, so once such a check has accepted, it need not even be parsed
+/// again. The names are sorted and deduplicated, since only their set
+/// matters, and each is length-prefixed.
+pub fn export_key(checker: &[u8; 32], bytes: &Hash, names: &[String]) -> Hash {
+    let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut h = blake3::Hasher::new_derive_key(EXPORT_CONTEXT);
+    h.update(checker).update(bytes).update(&(names.len() as u64).to_le_bytes());
+    for n in names {
+        h.update(&(n.len() as u64).to_le_bytes()).update(n.as_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
 /// Declarations the kernel uses without the term mentioning them.
 struct Implicit {
     nat: Option<usize>,
@@ -166,4 +187,23 @@ fn unhex(s: &str) -> Option<Hash> {
         *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::export_key;
+
+    #[test]
+    fn export_key_depends_on_checker_bytes_and_the_set_of_names() {
+        let (c, b) = ([1u8; 32], [2u8; 32]);
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let k = export_key(&c, &b, &s(&["A", "B"]));
+        assert_eq!(k, export_key(&c, &b, &s(&["B", "A", "A"])));
+        assert_ne!(k, export_key(&c, &b, &s(&["A"])));
+        assert_ne!(k, export_key(&c, &b, &s(&[])));
+        assert_ne!(k, export_key(&[3u8; 32], &b, &s(&["A", "B"])));
+        assert_ne!(k, export_key(&c, &[4u8; 32], &s(&["A", "B"])));
+        // Length prefixes: names cannot run into each other.
+        assert_ne!(export_key(&c, &b, &s(&["AB"])), export_key(&c, &b, &s(&["A", "B"])));
+    }
 }

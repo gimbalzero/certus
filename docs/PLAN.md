@@ -31,9 +31,9 @@ The goal is to be the best proof-checking system on all 44 axes in [SCOREBOARD.m
 - [x] `certus extract`: minimal certificates; race against Lean, nanoda, con-leche ([results](../benchmarks/race))
 - [x] Tamper suite: wrong proof, changed statement, missing dependency, forged recursor, data as theorem, injected field, partial definition
 - [x] Nested inductive types (needed for `Lean.Syntax`, `Array`-based types, much of Mathlib)
-- [ ] Multi-core checking (Certus already uses the least CPU; parallelism should make it fastest on the clock)
-- [ ] Check all of Lean's core library, then the Lean Kernel Arena tests
-- Per-declaration cache keyed by content hash: unchanged declarations are never re-checked
+- [x] Multi-core checking: `certus check --jobs N`, the same verdict for every N ([#2](https://github.com/gimbalzero/certus/issues/2), [#39](https://github.com/gimbalzero/certus/issues/39))
+- [x] Check all of Lean's core library, then the Lean Kernel Arena tests ([#3](https://github.com/gimbalzero/certus/issues/3); both Arena suites: 0 false accepts, 0 false rejects)
+- [x] Per-declaration cache keyed by content hash: unchanged declarations are never re-checked, and an unchanged export is not even parsed ([CACHE.md](CACHE.md))
 - [x] Check only the dependency closure of the target
 - All of Mathlib exported as certificates
 - **Done when** it beats nanoda's 18 s on Lean's core library, re-checks any cached project in under 1 s, and agrees with Lean on all Lean Kernel Arena tests. Then post on the Lean Zulip.
