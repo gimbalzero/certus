@@ -75,6 +75,22 @@ The CI run's explicit rounds, for comparison: round 1 Certus 8 ms, nanoda 6 ms, 
 4. **Lean's own checkers trust their imports.** `leanchecker` and the Lean build re-check only the file's own declarations and load the rest from `.olean` files. Certus re-checks everything the theorem depends on, and is still faster.
 5. **Automation narrows the gap but does not close it.** `simp` and `omega` find their proofs quickly, but the proofs they leave behind are large, so checking the certificate costs more. On 1,000 automated copies every certificate checker still beats the Lean build (3.2–9.5× in CI), and Certus still uses the least CPU (8.7 s against nanoda's 10.8 s and con-leche's 13.8 s). Here single-threading costs Certus the most: on the clock it is 3× behind nanoda.
 
+## Lean's whole core library (issue #3)
+
+Not a race round, but the largest test: lean4export's export of `benchmarks/proof-bench/lean/Empty.lean`, which is all of Lean 4.36's `Init` (58,547 declarations, 348 MB, 6.5M records; the export itself takes 31 s). **Certus accepts every declaration**, both on `main` and with the open kernel pull requests. Measured on the Apple M2 (8 cores), 22 Nov 2026, one run each, all in the same session:
+
+| Checker | Wall time | CPU time | Peak memory |
+|---|---|---|---|
+| nanoda (8 threads) | **8.1 s** | 38.3 s | 0.43 GB |
+| **Certus**, with #36, #38, #40, #41 (4 threads) | **9.7 s** | **31.2 s** | 4.5 GB |
+| Certus, same, 8 threads | 12.6 s | 62.0 s | 7.7 GB |
+| con-leche (8 threads) | 20.1 s | 92.2 s | 0.82 GB |
+| Certus, same, 1 thread | 21.2 s | 20.0 s (least CPU) | 1.9 GB |
+| Certus `main` (1 thread) | 40.9 s | 40.6 s | 1.9 GB |
+| **Certus re-check with the verdict cache (#41), unchanged** | **3.3 s** | 3.3 s | 0.49 GB |
+
+The figures in issue #3 (nanoda 18 s wall / 63 CPU-s, con-leche 56 s / 167 CPU-s) come from an earlier local measurement. The table above measures all three checkers in one session, so compare within it. In the same session, Certus on one thread uses about half of nanoda's CPU, and the kernel speed-ups of #38 halve Certus's own time (40.9 s to 21.2 s). With several threads, every Certus worker converts the whole library into its own term store, so memory grows with the thread count and 8 threads are slower than 4. Sharing the converted terms between workers is #39. Reproduce with `lean -o olean/Empty.olean Empty.lean && leanexport Empty > init.ndjson` in `benchmarks/proof-bench/lean`, then `certus check init.ndjson --no-cache --jobs 4`.
+
 ## Other provers: Rocq, Agda, Isabelle, HOL Light
 
 The same theorem, written natively in each system under `benchmarks/race/<system>/` (`Sum.*`, plus `gen.py` for the 1,000-copy file, each copy with its own recursive definition). Each one needs GBs of disk, so `.github/workflows/race-systems.yml` checks them on GitHub Actions with `benchmarks/race/systems.py`. Measured on `ubuntu-latest` (4 cores), [run 44949005331](https://github.com/gimbalzero/certus/actions/runs/44949005331), 21 Nov 2026: best of 3 runs (1 run for HOL Light).
