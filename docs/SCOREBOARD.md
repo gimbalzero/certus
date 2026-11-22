@@ -11,7 +11,7 @@ Status key: ⬜ not started · 🟨 started · 🟩 measured win · ➖ out of s
 | 1 | Fresh full check | Source to "verified" | Metamath: all of set.mm (48k theorems) in **6.9–10.1 s**, 1 core ([measured](../benchmarks/proof-bench)) | RH proof ≈ 20 h on 256 cores | Minutes on a laptop, from certificates | 🟩 1,000 theorems + foundations: 0.38 s vs Lean's 5.7 s build ([race](../benchmarks/race)) |
 | 2 | Kernel check speed | Steps or declarations per second per core | Metamath Zero | nanoda: core library (58,555 decls) in **63 CPU-s** ([measured](../benchmarks/proof-bench)) | ≥ 1M steps/s/core (H2) | 🟨 Certus kernel: 3,080 decls in 0.38 CPU-s, the least CPU of the checkers raced ([race](../benchmarks/race)) |
 | 3 | Rebuild after one edit | Seconds | Isabelle, Lean | Re-elaborates everything downstream | < 1 s | ⬜ Phase 3 |
-| 4 | Re-check unchanged project | Seconds | Nobody | **18 s** wall re-checking the core library every run ([measured](../benchmarks/proof-bench)) | < 1 s (content-hash cache) | 🟨 hashing done: 6.5M nodes in 1.3 s |
+| 4 | Re-check unchanged project | Seconds | Nobody | **18 s** wall re-checking the core library every run ([measured](../benchmarks/proof-bench)) | < 1 s (content-hash cache) | 🟨 verdict cache ([docs](CACHE.md)): unchanged 3,080-declaration certificate re-checked in 44 ms; one changed definition re-checks only it and its dependents |
 | 5 | Editor responsiveness | ms per edit | Isabelle | Good on small files, poor on large | < 50 ms | ➖ Phase 4 |
 | 6 | Parallel scaling | Speedup with cores | Nobody well | Limited by files and chains | Near-linear (per-declaration) | 🟨 `certus check --jobs N`, same verdict for every N: 1,000 theorems in 70 ms on 8 threads vs 210 ms on 1 (nanoda 84 ms), 3.6× on the 28.9 MB automated round |
 | 7 | Memory | Peak RAM | Metamath | High | 10× below Lean | 🟨 whole core library in 0.5 GB |
@@ -31,7 +31,7 @@ Status key: ⬜ not started · 🟨 started · 🟩 measured win · ➖ out of s
 | 16 | Escape-hatch control | Every unchecked shortcut detected | Metamath (none exist) | `#print axioms`, comparator | Automatic, for every theorem | 🟨 `certus deps` lists axioms and flags `sorryAx`, unsafe and partial; matches `#print axioms` |
 | 17 | Statement auditing | Shows exactly what was proved | Nobody does this well | comparator (new) | Audit report per theorem | 🟨 `certus deps` prints the exact statement next to its axioms and closure size; `certus show` prints any constant's statement, with notation or `--raw` |
 | 18 | Reproducible verdicts | Same input, same verdict, bit for bit | Metamath | Toolchain drift | Bit-for-bit | 🟨 deterministic root hash per export |
-| 19 | Cache integrity | Corruption caught | Nobody | Fragile | Every entry checked by hash | 🟨 content hashes ([spec](spec/certificate-v0.md)) |
+| 19 | Cache integrity | Corruption caught | Nobody | Fragile | Every entry checked by hash | 🟨 every key recomputed from the export, every entry carries a check value; bad entries only cause re-checks ([docs](CACHE.md)) |
 
 ## C. Logic and expressiveness
 
