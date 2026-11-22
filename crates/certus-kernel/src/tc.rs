@@ -170,7 +170,9 @@ impl<'a> TC<'a> {
                 self.st.cnst(n, &[])
             }
             Node::Str(_) => {
-                let n = self.env.builtins.string.ok_or("string literal, but no String in the environment")?;
+                let n = self.env.builtins.string.ok_or(
+                    "string literal, but String, String.ofList (or String.mk), Char, Char.ofNat, List.nil and List.cons are not all declared with their standard types",
+                )?;
                 self.get_const(n).ok_or("string literal before String is declared")?;
                 self.st.cnst(n, &[])
             }
@@ -466,7 +468,9 @@ impl<'a> TC<'a> {
     fn reduce_proj(&mut self, idx: u32, s: E) -> R<Option<E>> {
         let mut w = self.whnf(s)?;
         if let Node::Str(_) = self.st.node(w) {
-            w = self.str_to_ctor(w)?;
+            // The expansion's head may be a definition (`String.ofList`).
+            let c = self.str_to_ctor(w)?;
+            w = self.whnf(c)?;
         }
         let (h, args) = self.st.spine(w);
         let Node::Const(c, _) = self.st.node(h) else { return Ok(None) };
@@ -493,7 +497,10 @@ impl<'a> TC<'a> {
                 major = self.whnf(major)?;
                 match self.st.node(major) {
                     Node::Nat(_) => major = self.nat_lit_to_ctor(major)?,
-                    Node::Str(_) => major = self.str_to_ctor(major)?,
+                    Node::Str(_) => {
+                        let c = self.str_to_ctor(major)?;
+                        major = self.whnf(c)?;
+                    }
                     _ => major = self.ctor_when_structure(*major_induct, major)?,
                 }
                 let (mh, margs) = self.st.spine(major);
@@ -602,12 +609,13 @@ impl<'a> TC<'a> {
         }
     }
 
-    /// `"ab"` becomes `String.mk [Char.ofNat 97, Char.ofNat 98]`.
+    /// `"ab"` becomes `String.ofList [Char.ofNat 97, Char.ofNat 98]` (or
+    /// `String.mk …` before Lean 4.22; see `activate_string` in check.rs).
     fn str_to_ctor(&mut self, e: E) -> R<E> {
         let Node::Str(i) = self.st.node(e) else { return Ok(e) };
         let s: Vec<u32> = self.st.str_val(i).chars().map(|c| c as u32).collect();
         let b = self.env.builtins.clone();
-        let miss = "string literal needs String.mk, Char.ofNat, List.nil and List.cons";
+        let miss = "string literal, but String, String.ofList (or String.mk), Char, Char.ofNat, List.nil and List.cons are not all declared with their standard types";
         let (smk, ch, ofnat, nil, cons) = (
             b.string_mk.ok_or(miss)?,
             b.char.ok_or(miss)?,
@@ -978,7 +986,17 @@ impl<'a> TC<'a> {
                 let pred = self.st.nat(v - 1u32);
                 Ok(Some(self.is_def_eq(pred, args[0])?))
             }
-            Node::Str(_) if head_name.is_some() && head_name == b.string_mk => {
+            // Against the expansion function, or (once lazy delta has unfolded
+            // `String.ofList`) against a constructor of `String`.
+            Node::Str(_)
+                if head_name.is_some()
+                    && b.string.is_some()
+                    && (head_name == b.string_mk
+                        || matches!(
+                            head_name.and_then(|n| self.get_const(n)).map(|c| c.kind.clone()),
+                            Some(Kind::Ctor { induct, .. }) if Some(induct) == b.string
+                        )) =>
+            {
                 let c = self.str_to_ctor(t)?;
                 Ok(Some(self.is_def_eq(c, s)?))
             }
