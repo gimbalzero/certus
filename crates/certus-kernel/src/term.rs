@@ -51,6 +51,9 @@ pub struct Info {
     pub has_lparam: bool,
 }
 
+/// End of a `Store::nat_next` chain.
+const NO_NAT: u32 = u32::MAX;
+
 pub struct Store {
     nodes: Vec<Node>,
     info: Vec<Info>,
@@ -61,11 +64,39 @@ pub struct Store {
     lists: Vec<Box<[L]>>,
     list_map: FxHashMap<Box<[L]>, Ls>,
     nats: Vec<BigUint>,
-    nat_map: FxHashMap<BigUint, u32>,
+    /// Hash of a literal's value -> index of the last literal with that hash;
+    /// `nat_next` chains literals whose values collide. Literals can be huge
+    /// (megabits), so each value is stored once, in `nats`.
+    nat_map: FxHashMap<u64, u32>,
+    nat_next: Vec<u32>,
     strs: Vec<Box<str>>,
     str_map: FxHashMap<Box<str>, u32>,
     leq_cache: FxHashMap<(L, L), bool>,
+    /// Interned lists of universe parameter names (keys of `ilp_cache`).
+    name_lists: FxHashMap<Box<[NameId]>, u32>,
+    /// `instantiate_lparams(e, ps, ls)`, keyed by `(e, ps, ls)`. Unfolding a
+    /// definition instantiates its value afresh each time; this makes repeats free.
+    ilp_cache: FxHashMap<(E, u32, Ls), E>,
+    /// Reusable memo tables for the term traversals (cleared after each use),
+    /// so small substitutions do not allocate.
+    memo_inst: FxHashMap<(E, u32), E>,
+    memo_lift: FxHashMap<(E, u32), E>,
+    memo_abs: FxHashMap<(E, u32), E>,
+    memo_ilp: FxHashMap<E, E>,
     pub zero: L,
+}
+
+/// A memo table that grew past this many entries is dropped rather than
+/// cleared, so one huge traversal does not slow down every later small one.
+const MEMO_KEEP: usize = 1 << 9;
+
+fn recycle<K, V>(mut m: FxHashMap<K, V>) -> FxHashMap<K, V> {
+    if m.capacity() > MEMO_KEEP {
+        FxHashMap::default()
+    } else {
+        m.clear();
+        m
+    }
 }
 
 impl Default for Store {
@@ -87,9 +118,16 @@ impl Store {
             list_map: FxHashMap::default(),
             nats: Vec::new(),
             nat_map: FxHashMap::default(),
+            nat_next: Vec::new(),
             strs: Vec::new(),
             str_map: FxHashMap::default(),
             leq_cache: FxHashMap::default(),
+            name_lists: FxHashMap::default(),
+            ilp_cache: FxHashMap::default(),
+            memo_inst: FxHashMap::default(),
+            memo_lift: FxHashMap::default(),
+            memo_abs: FxHashMap::default(),
+            memo_ilp: FxHashMap::default(),
             zero: L(0),
         };
         s.zero = s.level(Level::Zero);
@@ -329,15 +367,18 @@ impl Store {
     }
 
     pub fn nat(&mut self, n: BigUint) -> E {
-        let i = match self.nat_map.get(&n) {
-            Some(&i) => i,
-            None => {
-                let i = self.nats.len() as u32;
-                self.nats.push(n.clone());
-                self.nat_map.insert(n, i);
-                i
+        use std::hash::BuildHasher;
+        let h = rustc_hash::FxBuildHasher.hash_one(&n);
+        let mut cur = self.nat_map.get(&h).copied().unwrap_or(NO_NAT);
+        while cur != NO_NAT {
+            if self.nats[cur as usize] == n {
+                return self.mk(Node::Nat(cur));
             }
-        };
+            cur = self.nat_next[cur as usize];
+        }
+        let i = self.nats.len() as u32;
+        self.nats.push(n);
+        self.nat_next.push(self.nat_map.insert(h, i).unwrap_or(NO_NAT));
         self.mk(Node::Nat(i))
     }
 
@@ -387,14 +428,22 @@ impl Store {
     }
 
     /// Head and arguments of an application spine.
-    pub fn spine(&self, mut e: E) -> (E, Vec<E>) {
-        let mut args = Vec::new();
-        while let Node::App(f, a) = self.node(e) {
-            args.push(a);
-            e = f;
+    pub fn spine(&self, e: E) -> (E, Vec<E>) {
+        // Count first, so the vector is allocated once at its final size.
+        let mut n = 0;
+        let mut h = e;
+        while let Node::App(f, _) = self.node(h) {
+            n += 1;
+            h = f;
         }
-        args.reverse();
-        (e, args)
+        let mut args = vec![E(0); n];
+        let mut cur = e;
+        while let Node::App(f, a) = self.node(cur) {
+            n -= 1;
+            args[n] = a;
+            cur = f;
+        }
+        (h, args)
     }
 
     pub fn head(&self, mut e: E) -> E {
@@ -410,8 +459,10 @@ impl Store {
         if args.is_empty() || self.info(e).lbr == 0 {
             return e;
         }
-        let mut memo = FxHashMap::default();
-        self.inst_go(e, 0, args, &mut memo)
+        let mut memo = std::mem::take(&mut self.memo_inst);
+        let r = self.inst_go(e, 0, args, &mut memo);
+        self.memo_inst = recycle(memo);
+        r
     }
 
     fn inst_go(&mut self, e: E, off: u32, args: &[E], memo: &mut FxHashMap<(E, u32), E>) -> E {
@@ -464,8 +515,10 @@ impl Store {
         if d == 0 || self.info(e).lbr == 0 {
             return e;
         }
-        let mut memo = FxHashMap::default();
-        self.lift_go(e, 0, d, &mut memo)
+        let mut memo = std::mem::take(&mut self.memo_lift);
+        let r = self.lift_go(e, 0, d, &mut memo);
+        self.memo_lift = recycle(memo);
+        r
     }
 
     fn lift_go(&mut self, e: E, off: u32, d: u32, memo: &mut FxHashMap<(E, u32), E>) -> E {
@@ -511,8 +564,10 @@ impl Store {
         if fvars.is_empty() || !self.info(e).has_fvar {
             return e;
         }
-        let mut memo = FxHashMap::default();
-        self.abs_go(e, 0, fvars, &mut memo)
+        let mut memo = std::mem::take(&mut self.memo_abs);
+        let r = self.abs_go(e, 0, fvars, &mut memo);
+        self.memo_abs = recycle(memo);
+        r
     }
 
     fn abs_go(&mut self, e: E, off: u32, fvars: &[u32], memo: &mut FxHashMap<(E, u32), E>) -> E {
@@ -560,8 +615,23 @@ impl Store {
         if ps.is_empty() || !self.info(e).has_lparam {
             return e;
         }
-        let mut memo = FxHashMap::default();
-        self.ilp_go(e, ps, ls, &mut memo)
+        let ls_id = self.list(ls);
+        let ps_id = match self.name_lists.get(ps) {
+            Some(&i) => i,
+            None => {
+                let i = self.name_lists.len() as u32;
+                self.name_lists.insert(ps.into(), i);
+                i
+            }
+        };
+        if let Some(&r) = self.ilp_cache.get(&(e, ps_id, ls_id)) {
+            return r;
+        }
+        let mut memo = std::mem::take(&mut self.memo_ilp);
+        let r = self.ilp_go(e, ps, ls, &mut memo);
+        self.memo_ilp = recycle(memo);
+        self.ilp_cache.insert((e, ps_id, ls_id), r);
+        r
     }
 
     fn ilp_go(&mut self, e: E, ps: &[NameId], ls: &[L], memo: &mut FxHashMap<E, E>) -> E {
@@ -707,4 +777,40 @@ fn short(n: Node) -> &'static str {
     }
 }
 
-impl Store {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nat_literals_are_interned_by_value() {
+        let mut st = Store::new();
+        let big = BigUint::from(3u32).pow(100_000);
+        let a = st.nat(big.clone());
+        let b = st.nat(big.clone() + 1u32);
+        assert_ne!(a, b);
+        assert_eq!(st.nat(big.clone()), a);
+        assert_eq!(st.nat(big + 1u32), b);
+        assert_eq!(st.nat(BigUint::from(0u32)), st.nat(BigUint::from(0u32)));
+        assert_eq!(st.nats.len(), 3, "each value is stored once");
+    }
+
+    #[test]
+    fn instantiate_lparams_cache_respects_parameter_order() {
+        let mut st = Store::new();
+        let (u, v) = (st.level(Level::Param(1)), st.level(Level::Param(2)));
+        let one = st.succ(st.zero);
+        let su = st.sort(u);
+        let sv = st.sort(v);
+        let e = st.mk(Node::Pi(su, sv)); // Sort u → Sort v
+        let z = st.zero;
+        let a = st.instantiate_lparams(e, &[1, 2], &[z, one]);
+        let b = st.instantiate_lparams(e, &[2, 1], &[z, one]);
+        assert_ne!(a, b);
+        let (s0, s1) = (st.sort(z), st.sort(one));
+        assert_eq!(a, st.mk(Node::Pi(s0, s1)));
+        assert_eq!(b, st.mk(Node::Pi(s1, s0)));
+        // Cached results agree with fresh ones.
+        assert_eq!(st.instantiate_lparams(e, &[1, 2], &[z, one]), a);
+        assert_eq!(st.instantiate_lparams(e, &[2, 1], &[z, one]), b);
+    }
+}
