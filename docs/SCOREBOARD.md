@@ -23,7 +23,7 @@ Status key: ⬜ not started · 🟨 started · 🟩 measured win · ➖ out of s
 
 | # | Axis | Measure | Best today | Lean 4 | Certus target | Status |
 |---|---|---|---|---|---|---|
-| 11 | Trusted code size | Lines that must be right | Metamath Zero (~730 lines of C) | ~8–20k lines of C++ (est.) | < 5k lines of Rust | 🟨 ~2,800 lines today (not yet complete: no nested inductives) |
+| 11 | Trusted code size | Lines that must be right | Metamath Zero (~730 lines of C) | ~8–20k lines of C++ (est.) | < 5k lines of Rust | 🟨 ~3,700 lines today (`wc -l crates/certus-kernel/src/*.rs`), including nested inductives |
 | 12 | Verified kernel | Formal proof of the checker | Candle (to machine code) | Lean4Lean, partial | Aeneas or Verus proof | ⬜ Phase 2 |
 | 13 | Independent checkers | Separately written checkers that agree | **Lean** (nanoda, Lean4Lean, con-leche, …) | Strong | 3+ by default | 🟨 Certus is a new independent checker; agrees with nanoda and con-leche on all race certificates |
 | 14 | Soundness record and response | Bugs/year, disclosure process | HOL Light | Kernel bugs exploited in 2026 | Fixed disclosure timeline | 🟨 [SECURITY.md](../SECURITY.md) |
