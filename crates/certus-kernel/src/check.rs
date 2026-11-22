@@ -4,7 +4,7 @@
 use crate::env::{Builtins, ConstInfo, Hints, KEnv, Kind, QuotKind, RecRule};
 use crate::inductive::{self, Block};
 use crate::quot::check_quot;
-use crate::tc::{R, TC};
+use crate::tc::{KError, R, STACK_SIZE, TC};
 use crate::term::{E, L, Level, Node, Store};
 use certus_core::export::{self as ex, Decl, Env, NameId};
 use num_bigint::BigUint;
@@ -16,6 +16,16 @@ use std::time::{Duration, Instant};
 pub struct CheckError {
     pub decl: String,
     pub msg: String,
+    /// `true` if checking ran out of resources (work budget or stack) before
+    /// reaching a verdict, `false` if the declaration is invalid. Either way
+    /// nothing is accepted.
+    pub resource: bool,
+}
+
+impl CheckError {
+    fn new(decl: String, e: KError) -> Self {
+        CheckError { decl, resource: e.is_resource(), msg: e.msg().to_string() }
+    }
 }
 
 impl std::fmt::Display for CheckError {
@@ -103,7 +113,27 @@ impl Conv<'_> {
 /// Check the declarations at indices `decls` (ascending file order). Every
 /// dependency must be in the list: anything missing is reported as an
 /// unknown constant, never assumed.
+///
+/// Checking runs on a dedicated thread with a large stack (`STACK_SIZE`), so
+/// deeply nested terms and definitional-equality checks work the same for
+/// every caller. Running short of that stack is a resource error, not a crash.
 pub fn check(env: &Env, decls: &[usize]) -> Result<Report, CheckError> {
+    std::thread::scope(|s| {
+        let worker = std::thread::Builder::new()
+            .name("certus-check".into())
+            .stack_size(STACK_SIZE)
+            .spawn_scoped(s, || check_on_this_thread(env, decls))
+            .map_err(|e| CheckError {
+                decl: String::new(),
+                msg: format!("cannot start the checker thread: {e}"),
+                resource: true,
+            })?;
+        worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+fn check_on_this_thread(env: &Env, decls: &[usize]) -> Result<Report, CheckError> {
+    crate::tc::set_stack_base();
     let start = Instant::now();
     let mut st = Store::new();
     let mut kenv = KEnv::default();
@@ -137,11 +167,11 @@ pub fn check(env: &Env, decls: &[usize]) -> Result<Report, CheckError> {
         let d = &env.decls[i];
         let t0 = Instant::now();
         let name = || strs[d.primary_name() as usize].clone();
-        let new = check_decl(&mut st, &kenv, &mut conv, env, d).map_err(|msg| CheckError { decl: name(), msg })?;
+        let new = check_decl(&mut st, &kenv, &mut conv, env, d).map_err(|e| CheckError::new(name(), e))?;
         let added: Vec<NameId> = new.iter().map(|(n, _)| *n).collect();
         for (n, info) in new {
             if kenv.consts.insert(n, Arc::new(info)).is_some() {
-                return Err(CheckError { decl: name(), msg: "constant declared twice".into() });
+                return Err(CheckError { decl: name(), msg: "constant declared twice".into(), resource: false });
             }
         }
         for n in added {
@@ -293,7 +323,7 @@ fn check_decl(st: &mut Store, kenv: &KEnv, conv: &mut Conv, env: &Env, d: &Decl)
         }
         Decl::Def(a) => {
             if a.safety != "safe" {
-                return Err(format!("{} definitions are not accepted", a.safety));
+                return Err(format!("{} definitions are not accepted", a.safety).into());
             }
             distinct(&a.level_params)?;
             let hints = hints_of(&a.hints)?;
@@ -335,7 +365,7 @@ fn check_decl(st: &mut Store, kenv: &KEnv, conv: &mut Conv, env: &Env, d: &Decl)
                 "ctor" => QuotKind::Ctor,
                 "lift" => QuotKind::Lift,
                 "ind" => QuotKind::Ind,
-                k => return Err(format!("unknown quotient kind {k:?}")),
+                k => return Err(format!("unknown quotient kind {k:?}").into()),
             };
             let b = &kenv.builtins;
             let expected_name = match kind {
