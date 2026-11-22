@@ -91,6 +91,24 @@ pub(crate) fn set_stack_base() {
     STACK_LIMIT.with(|l| l.set(limit));
 }
 
+/// A constant, from the environment or from the block being checked. The
+/// environment may be shared by several threads, so its constants are
+/// borrowed, not reference-counted.
+pub enum CRef<'a> {
+    Env(&'a ConstInfo),
+    Local(Arc<ConstInfo>),
+}
+
+impl std::ops::Deref for CRef<'_> {
+    type Target = ConstInfo;
+    fn deref(&self) -> &ConstInfo {
+        match self {
+            CRef::Env(c) => c,
+            CRef::Local(c) => c,
+        }
+    }
+}
+
 pub struct TC<'a> {
     pub st: &'a mut Store,
     pub env: &'a KEnv,
@@ -133,8 +151,12 @@ impl<'a> TC<'a> {
         }
     }
 
-    pub fn get_const(&self, n: NameId) -> Option<Arc<ConstInfo>> {
-        self.local.get(&n).cloned().or_else(|| self.env.get(n))
+    pub fn get_const(&self, n: NameId) -> Option<CRef<'a>> {
+        if let Some(c) = self.local.get(&n) {
+            return Some(CRef::Local(c.clone()));
+        }
+        let env: &'a KEnv = self.env;
+        env.get(n).map(CRef::Env)
     }
 
     /// One unit of work. Every recursive step of inference, reduction and

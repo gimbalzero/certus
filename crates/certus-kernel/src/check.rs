@@ -1,7 +1,7 @@
 //! Driver: convert exported declarations to kernel terms and check them in
 //! dependency order, adding each to the environment only once it passes.
 
-use crate::env::{Builtins, ConstInfo, Hints, KEnv, Kind, QuotKind, RecRule};
+use crate::env::{Builtins, ConstInfo, ConstTable, Hints, KEnv, Kind, QuotKind, RecRule};
 use crate::inductive::{self, Block};
 use crate::quot::check_quot;
 use crate::tc::{KError, R, STACK_SIZE, TC};
@@ -11,7 +11,7 @@ use certus_core::{deps, hash};
 use num_bigint::BigUint;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -129,24 +129,33 @@ pub fn check(env: &Env, decls: &[usize]) -> Result<Report, CheckError> {
 
 /// [`check`] on `jobs` threads, with exactly the same verdict.
 ///
-/// Every worker walks the whole list in file order with its own term store,
-/// so each builds exactly the environment the sequential checker would
-/// build. A worker *claims* each definition, theorem, opaque or axiom before
-/// it reaches it, and type-checks only the ones it claimed. The others it
-/// only *admits*: it runs every check that does not need the type checker
-/// (safety, universe parameters, conversion) and adds them as they are.
-/// Inductive types and quotients are cheap, and their recursors and rules
-/// must be built by each worker, so every worker checks them in full. So
-/// each declaration is type-checked exactly once, by whichever worker got
-/// there first.
+/// On one thread, declarations are checked one after the other, in file
+/// order. On several, checking runs in two phases.
+///
+/// 1. One thread walks the declarations in file order. It converts every term
+///    once, into one term store, runs every check that does not need the type
+///    checker (safety, universe parameters, duplicate names), checks
+///    inductive types and quotients in full (they are cheap, and their
+///    recursors and rules are needed by everything after them), and records
+///    every constant together with the position of the declaration that added
+///    it. It stops at the first declaration that fails.
+/// 2. That store is frozen and shared read-only by `jobs` threads, together
+///    with the table of constants. The threads take the remaining
+///    definitions, theorems, opaques and axioms in file order, each from a
+///    shared counter, so each is type-checked exactly once. A declaration at
+///    position `p` is checked in the environment of the constants added
+///    before `p` (see `KEnv::visible`): exactly the environment the
+///    sequential checker would build, apart from the builtins (`Nat`
+///    arithmetic and string literals), which are also taken as they were at
+///    `p`. Terms the type checker creates go into each thread's own store, on
+///    top of the shared one.
 ///
 /// Verdict: the failure at the earliest position, as in sequential checking.
-/// Everything before the first failure passes, so the worker that checks it
-/// sees the same environment as the sequential checker would, and reaches the
-/// same verdict. Declarations admitted by other workers may still be
-/// unchecked when used, but a failure at a later position is never
-/// reported ahead of an earlier one. Once a failure is known, workers stop
-/// at that position.
+/// Everything before the first failure passes, so its checker sees the same
+/// environment as the sequential checker would, and reaches the same
+/// verdict. Declarations before `p` may still be unchecked when `p` is
+/// checked, but a failure at a later position is never reported ahead of an
+/// earlier one. Once a failure is known, threads stop at that position.
 pub fn check_jobs(env: &Env, decls: &[usize], jobs: usize) -> Result<Report, CheckError> {
     check_with(env, decls, jobs, &[])
 }
@@ -169,56 +178,68 @@ pub fn check_with(env: &Env, decls: &[usize], jobs: usize, known_good: &[bool]) 
     }
     let known = |p: usize| known_good.get(p).copied().unwrap_or(false);
     let prep = Prep::new(env);
-    let jobs = jobs.clamp(1, decls.len().max(1));
+    // On one thread, phase 1 also type-checks each declaration as it goes,
+    // which leaves nothing for phase 2.
+    let inline = jobs <= 1;
+    let mut pre = std::thread::scope(|s| {
+        let h = spawn_checker(s, "certus-check".into(), || prepare(env, decls, &prep, &known, inline))?;
+        Ok(h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+    })?;
+    let todo = pre.todo.iter().filter(|t| t.is_some()).count();
+    let jobs = if todo == 0 { 0 } else { jobs.clamp(1, todo) };
     let shared = Shared {
-        // Known-good declarations count as claimed, so no worker checks them.
-        claimed: (0..decls.len()).map(|p| AtomicBool::new(known(p))).collect(),
-        first_failure: AtomicUsize::new(usize::MAX),
-        parallel: jobs > 1 || !known_good.is_empty(),
+        strs: &prep.strs,
+        todo: std::mem::take(&mut pre.todo),
+        consts: std::mem::take(&mut pre.consts),
+        builtins: std::mem::take(&mut pre.builtins),
+        next: AtomicUsize::new(0),
+        first_failure: AtomicUsize::new(pre.failure.as_ref().map_or(usize::MAX, |(p, _)| *p)),
     };
+    let skip = pre.term_nodes;
+    let store = std::mem::take(&mut pre.store);
     let outs: Vec<Worker> = std::thread::scope(|s| {
+        let shared = &shared;
         let mut handles = Vec::new();
-        for w in 0..jobs {
-            let (prep, shared) = (&prep, &shared);
-            let h = std::thread::Builder::new()
-                .name(format!("certus-check-{w}"))
-                .stack_size(STACK_SIZE)
-                .spawn_scoped(s, move || run_worker(env, decls, prep, shared));
-            match h {
-                Ok(h) => handles.push(h),
-                // Fewer threads are fine (every declaration is still checked
-                // by someone), but at least one is needed.
-                Err(e) if handles.is_empty() => {
-                    return Err(CheckError {
-                        decl: String::new(),
-                        msg: format!("cannot start the checker thread: {e}"),
-                        resource: true,
-                    });
+        if jobs == 0 {
+            // Nothing to do.
+        } else if jobs == 1 {
+            // One thread: keep using the store of phase 1, without freezing it.
+            handles.push(spawn_checker(s, "certus-check-0".into(), move || run_worker(shared, store, skip))?);
+        } else {
+            let base = store.freeze();
+            for w in 0..jobs {
+                let st = Store::on(&base);
+                match spawn_checker(s, format!("certus-check-{w}"), move || run_worker(shared, st, skip)) {
+                    Ok(h) => handles.push(h),
+                    // Fewer threads are fine (every declaration is still checked
+                    // by someone), but at least one is needed.
+                    Err(e) if handles.is_empty() => return Err(e),
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
         }
         Ok(handles.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect())
     })?;
 
-    if let Some((_, e)) = outs.iter().filter_map(|w| w.failure.as_ref()).min_by_key(|(pos, _)| *pos) {
+    let failures = pre.failure.iter().chain(outs.iter().filter_map(|w| w.failure.as_ref()));
+    if let Some((_, e)) = failures.min_by_key(|(pos, _)| *pos) {
         return Err(CheckError { decl: e.decl.clone(), msg: e.msg.clone(), resource: e.resource });
     }
-    let mut times: Vec<(usize, Duration)> = outs.iter().flat_map(|w| w.times.iter().copied()).collect();
+    let mut times: Vec<(usize, Duration)> =
+        pre.times.iter().chain(outs.iter().flat_map(|w| w.times.iter())).copied().collect();
     times.sort_by_key(|a| std::cmp::Reverse(a.1));
-    let first = &outs[0];
     Ok(Report {
         checked: decls.len(),
-        by_kind: first.by_kind.clone(),
+        by_kind: pre.by_kind,
         time: start.elapsed(),
         slowest: times
             .iter()
             .take(5)
             .map(|&(i, t)| (prep.strs[env.decls[i].primary_name() as usize].clone(), t))
             .collect(),
-        term_nodes: outs.iter().map(|w| w.term_nodes).sum(),
-        native_nat_ops: first.native_nat_ops,
-        threads: outs.len(),
+        term_nodes: pre.term_nodes + outs.iter().map(|w| w.term_nodes).sum::<usize>(),
+        native_nat_ops: pre.native_nat_ops,
+        threads: outs.len().max(1),
         from_cache: decls
             .iter()
             .enumerate()
@@ -227,7 +248,27 @@ pub fn check_with(env: &Env, decls: &[usize], jobs: usize, known_good: &[bool]) 
     })
 }
 
-/// Name strings and builtin candidates, computed once and shared by all workers.
+/// Run `f` on a new thread with the checker's stack (`STACK_SIZE`).
+fn spawn_checker<'s, 'e, T: Send + 's>(
+    s: &'s std::thread::Scope<'s, 'e>,
+    name: String,
+    f: impl FnOnce() -> T + Send + 's,
+) -> Result<std::thread::ScopedJoinHandle<'s, T>, CheckError> {
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(STACK_SIZE)
+        .spawn_scoped(s, move || {
+            crate::tc::set_stack_base();
+            f()
+        })
+        .map_err(|e| CheckError {
+            decl: String::new(),
+            msg: format!("cannot start the checker thread: {e}"),
+            resource: true,
+        })
+}
+
+/// Name strings and builtin candidates, computed once.
 struct Prep {
     strs: Vec<String>,
     candidates: Builtins,
@@ -266,28 +307,39 @@ impl Prep {
     }
 }
 
-/// State shared by the workers of one `check_jobs` call.
-struct Shared {
-    /// `claimed[p]`: some worker type-checks the declaration at position `p`.
-    claimed: Vec<AtomicBool>,
-    /// Earliest position known to fail (`usize::MAX`: none yet).
-    first_failure: AtomicUsize,
-    parallel: bool,
+/// What the type checker still has to check for one declaration: that `ty`
+/// is a type (a proposition, if `thm`) and that `val`, if any, has type `ty`.
+struct Todo {
+    /// Index of the declaration in `env.decls`, and its name.
+    decl: usize,
+    decl_name: NameId,
+    lparams: Vec<NameId>,
+    ty: E,
+    val: Option<E>,
+    thm: bool,
 }
 
-/// What one worker found.
-struct Worker {
-    /// Position in `decls` and error of the first failure this worker met.
+/// The result of phase 1 (see `check_jobs`).
+struct Prepared {
+    store: Store,
+    consts: Arc<ConstTable>,
+    /// `(p, b)`: the builtins are `b` for the declarations from position `p`
+    /// on (until the next entry). Starts at position 0.
+    builtins: Vec<(usize, Builtins)>,
+    /// `todo[p]`: what is left to check of the declaration at position `p`.
+    todo: Vec<Option<Todo>>,
+    /// Position and error of the first declaration that failed.
     failure: Option<(usize, CheckError)>,
-    /// Time spent on each declaration this worker type-checked.
     times: Vec<(usize, Duration)>,
     by_kind: Vec<(&'static str, usize)>,
     term_nodes: usize,
     native_nat_ops: usize,
 }
 
-fn run_worker(env: &Env, decls: &[usize], prep: &Prep, shared: &Shared) -> Worker {
-    crate::tc::set_stack_base();
+/// Phase 1 of `check_jobs`. With `inline`, it also type-checks each declaration right away (in the
+/// environment of the declarations before it, as phase 2 would), so no
+/// `todo` is left.
+fn prepare(env: &Env, decls: &[usize], prep: &Prep, known: &dyn Fn(usize) -> bool, inline: bool) -> Prepared {
     let strs = &prep.strs;
     let candidates = &prep.candidates;
     let mut st = Store::new();
@@ -308,65 +360,133 @@ fn run_worker(env: &Env, decls: &[usize], prep: &Prep, shared: &Shared) -> Worke
         list_cons: None,
         ..candidates.clone()
     };
-    let mut kenv = KEnv { builtins, ..KEnv::default() };
+    let mut kenv = KEnv { builtins: builtins.clone(), ..KEnv::default() };
+    let mut history = vec![(0, builtins)];
 
     let mut conv = Conv { ex: env, exprs: vec![None; env.exprs.len()], levels: vec![None; env.levels.len()] };
     let mut counts: FxHashMap<&'static str, usize> = FxHashMap::default();
     let mut hashes: Option<hash::LazyHashes> = None;
     let mut times: Vec<(usize, Duration)> = Vec::new();
+    let mut todo: Vec<Option<Todo>> = Vec::with_capacity(decls.len());
     let mut failure = None;
 
     for (pos, &i) in decls.iter().enumerate() {
-        if pos > shared.first_failure.load(Ordering::Relaxed) {
-            break;
-        }
         let d = &env.decls[i];
-        let mode = match d {
-            Decl::Inductive(_) | Decl::Quot(_) => Mode::Check,
-            _ if !shared.parallel || !shared.claimed[pos].swap(true, Ordering::Relaxed) => Mode::Check,
-            _ => Mode::Admit,
-        };
+        kenv.visible = pos;
         let t0 = Instant::now();
         let name = || strs[d.primary_name() as usize].clone();
-        let new = match check_decl(&mut st, &kenv, &mut conv, env, d, mode) {
-            Ok(new) => new,
+        let (new, t) = match admit_decl(&mut st, &kenv, &mut conv, env, d) {
+            Ok(x) => x,
             Err(e) => {
                 failure = Some((pos, CheckError::new(name(), e)));
                 break;
             }
         };
+        let t = t.filter(|_| !known(pos));
+        if inline && let Some(t) = &t {
+            let mut tc = TC::new(&mut st, &kenv, t.lparams.clone());
+            if let Err(e) = check_todo(&mut tc, t) {
+                failure = Some((pos, CheckError::new(name(), e)));
+                break;
+            }
+        }
+        if t.is_none() || inline {
+            times.push((i, t0.elapsed()));
+            todo.push(None);
+        } else {
+            todo.push(t.map(|t| Todo { decl: i, ..t }));
+        }
         let added: Vec<NameId> = new.iter().map(|(n, _)| *n).collect();
         let mut twice = false;
+        let table = Arc::get_mut(&mut kenv.consts).expect("the constant table is not shared yet");
         for (n, info) in new {
-            twice |= kenv.consts.insert(n, Arc::new(info)).is_some();
+            twice |= table.insert(n, (pos, info)).is_some();
         }
         if twice {
             failure = Some((pos, CheckError { decl: name(), msg: "constant declared twice".into(), resource: false }));
             break;
         }
+        kenv.visible = pos + 1;
         for n in added {
             activate_nat(&mut st, &mut kenv, candidates, n, strs, env, &mut hashes);
             activate_string(&mut st, &mut kenv, candidates, n);
         }
-        *counts.entry(d.kind()).or_default() += 1;
-        if mode == Mode::Check {
-            times.push((i, t0.elapsed()));
+        if history.last().is_some_and(|(_, b)| *b != kenv.builtins) {
+            history.push((pos + 1, kenv.builtins.clone()));
         }
-    }
-    if let Some((pos, _)) = &failure {
-        shared.first_failure.fetch_min(*pos, Ordering::Relaxed);
+        *counts.entry(d.kind()).or_default() += 1;
     }
 
     let mut by_kind: Vec<(&'static str, usize)> = counts.into_iter().collect();
     by_kind.sort();
-    Worker { failure, times, by_kind, term_nodes: st.num_nodes(), native_nat_ops: kenv.builtins.nat_ops.len() }
+    Prepared {
+        term_nodes: st.num_nodes(),
+        native_nat_ops: kenv.builtins.nat_ops.len(),
+        store: st,
+        consts: kenv.consts,
+        builtins: history,
+        todo,
+        failure,
+        times,
+        by_kind,
+    }
 }
 
-/// Whether a worker type-checks a declaration or only admits it (see `check_jobs`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Check,
-    Admit,
+/// State shared by the threads of phase 2.
+struct Shared<'a> {
+    strs: &'a [String],
+    todo: Vec<Option<Todo>>,
+    consts: Arc<ConstTable>,
+    builtins: Vec<(usize, Builtins)>,
+    /// The next position to take.
+    next: AtomicUsize,
+    /// Earliest position known to fail (`usize::MAX`: none yet).
+    first_failure: AtomicUsize,
+}
+
+/// What one thread of phase 2 found.
+struct Worker {
+    /// Position in `decls` and error of the first failure this worker met.
+    failure: Option<(usize, CheckError)>,
+    /// Time spent on each declaration this worker type-checked.
+    times: Vec<(usize, Duration)>,
+    /// Terms created by this worker.
+    term_nodes: usize,
+}
+
+/// Phase 2 of `check_jobs`, on store `st`, which holds the `skip` terms of
+/// phase 1.
+fn run_worker(shared: &Shared, mut st: Store, skip: usize) -> Worker {
+    let mut kenv = KEnv { consts: shared.consts.clone(), visible: 0, builtins: Builtins::default() };
+    let mut era = usize::MAX;
+    let mut times: Vec<(usize, Duration)> = Vec::new();
+    let mut failure = None;
+    loop {
+        // Positions are taken in increasing order, so every position before
+        // a failure is taken (and checked) by some worker.
+        let pos = shared.next.fetch_add(1, Ordering::Relaxed);
+        if pos >= shared.todo.len() || pos >= shared.first_failure.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(t) = &shared.todo[pos] else { continue };
+        let e = shared.builtins.partition_point(|(p, _)| *p <= pos) - 1;
+        if e != era {
+            kenv.builtins = shared.builtins[e].1.clone();
+            era = e;
+        }
+        kenv.visible = pos;
+        let t0 = Instant::now();
+        let mut tc = TC::new(&mut st, &kenv, t.lparams.clone());
+        if let Err(e) = check_todo(&mut tc, t) {
+            failure = Some((pos, CheckError::new(shared.strs[t.decl_name as usize].clone(), e)));
+            break;
+        }
+        times.push((t.decl, t0.elapsed()));
+    }
+    if let Some((pos, _)) = &failure {
+        shared.first_failure.fetch_min(*pos, Ordering::Relaxed);
+    }
+    Worker { failure, times, term_nodes: st.num_nodes() - skip }
 }
 
 /// Fingerprints of the genuine `Nat` operations the kernel computes natively,
@@ -460,7 +580,9 @@ fn activate_nat<'e>(
     env: &'e Env,
     hashes: &mut Option<hash::LazyHashes<'e>>,
 ) {
-    let get = |kenv: &KEnv, n: Option<NameId>| n.and_then(|n| kenv.get(n));
+    fn get(kenv: &KEnv, n: Option<NameId>) -> Option<&ConstInfo> {
+        n.and_then(|n| kenv.get(n))
+    }
     if Some(n) == cand.nat {
         // `Nat : Type` with exactly `zero : Nat` and `succ : Nat → Nat`.
         let (Some(nat), Some(z), Some(s)) = (get(kenv, cand.nat), get(kenv, cand.nat_zero), get(kenv, cand.nat_succ))
@@ -649,35 +771,43 @@ fn check_value(tc: &mut TC, val: E, ty: E) -> R<()> {
     Ok(())
 }
 
-/// Check one declaration and return the constants it adds. With
-/// `Mode::Admit`, everything except the type checker runs (see `check_jobs`).
-fn check_decl(
-    st: &mut Store,
-    kenv: &KEnv,
-    conv: &mut Conv,
-    env: &Env,
-    d: &Decl,
-    mode: Mode,
-) -> R<Vec<(NameId, ConstInfo)>> {
-    let check = mode == Mode::Check;
+/// The type checker's part of checking a definition, theorem, opaque or axiom.
+fn check_todo(tc: &mut TC, t: &Todo) -> R<()> {
+    let l = check_type(tc, t.ty)?;
+    if t.thm && !tc.st.is_zero(l) {
+        return Err("theorem type is not a proposition".into());
+    }
+    if let Some(val) = t.val {
+        check_value(tc, val, t.ty)?;
+    }
+    Ok(())
+}
+
+/// The constants a declaration adds, and what is left for the type checker.
+type Admitted = (Vec<(NameId, ConstInfo)>, Option<Todo>);
+
+/// Phase 1 of checking one declaration (see `check_jobs`): convert its terms
+/// and run every check that does not need the type checker; check inductive
+/// types and quotients in full. Returns the constants it adds and, for a
+/// definition, theorem, opaque or axiom, what is left for the type checker.
+fn admit_decl(st: &mut Store, kenv: &KEnv, conv: &mut Conv, env: &Env, d: &Decl) -> R<Admitted> {
     for n in d.defined_names() {
-        if kenv.consts.contains_key(&n) {
+        if kenv.contains(n) {
             return Err("constant declared twice".into());
         }
     }
     let info = |lparams: &Vec<NameId>, ty, kind| ConstInfo { lparams: lparams.clone(), ty, kind };
-    Ok(match d {
+    let todo = |lparams: &Vec<NameId>, ty, val, thm| {
+        Some(Todo { decl: 0, decl_name: d.primary_name(), lparams: lparams.clone(), ty, val, thm })
+    };
+    let (new, t) = match d {
         Decl::Axiom(a) => {
             if a.is_unsafe {
                 return Err("unsafe axioms are not accepted".into());
             }
             distinct(&a.level_params)?;
             let ty = conv.expr(st, a.r#type)?;
-            if check {
-                let mut tc = TC::new(st, kenv, a.level_params.clone());
-                check_type(&mut tc, ty)?;
-            }
-            vec![(a.name, info(&a.level_params, ty, Kind::Axiom))]
+            (vec![(a.name, info(&a.level_params, ty, Kind::Axiom))], todo(&a.level_params, ty, None, false))
         }
         Decl::Def(a) => {
             if a.safety != "safe" {
@@ -687,26 +817,16 @@ fn check_decl(
             let hints = hints_of(&a.hints)?;
             let ty = conv.expr(st, a.r#type)?;
             let val = conv.expr(st, a.value)?;
-            if check {
-                let mut tc = TC::new(st, kenv, a.level_params.clone());
-                check_type(&mut tc, ty)?;
-                check_value(&mut tc, val, ty)?;
-            }
-            vec![(a.name, info(&a.level_params, ty, Kind::Def { val, hints }))]
+            (
+                vec![(a.name, info(&a.level_params, ty, Kind::Def { val, hints }))],
+                todo(&a.level_params, ty, Some(val), false),
+            )
         }
         Decl::Thm(a) => {
             distinct(&a.level_params)?;
             let ty = conv.expr(st, a.r#type)?;
             let val = conv.expr(st, a.value)?;
-            if check {
-                let mut tc = TC::new(st, kenv, a.level_params.clone());
-                let l = check_type(&mut tc, ty)?;
-                if !tc.st.is_zero(l) {
-                    return Err("theorem type is not a proposition".into());
-                }
-                check_value(&mut tc, val, ty)?;
-            }
-            vec![(a.name, info(&a.level_params, ty, Kind::Thm { val }))]
+            (vec![(a.name, info(&a.level_params, ty, Kind::Thm { val }))], todo(&a.level_params, ty, Some(val), true))
         }
         Decl::Opaque(a) => {
             if a.is_unsafe {
@@ -715,12 +835,7 @@ fn check_decl(
             distinct(&a.level_params)?;
             let ty = conv.expr(st, a.r#type)?;
             let val = conv.expr(st, a.value)?;
-            if check {
-                let mut tc = TC::new(st, kenv, a.level_params.clone());
-                check_type(&mut tc, ty)?;
-                check_value(&mut tc, val, ty)?;
-            }
-            vec![(a.name, info(&a.level_params, ty, Kind::Opaque))]
+            (vec![(a.name, info(&a.level_params, ty, Kind::Opaque))], todo(&a.level_params, ty, Some(val), false))
         }
         Decl::Quot(a) => {
             distinct(&a.level_params)?;
@@ -744,7 +859,7 @@ fn check_decl(
             let ty = conv.expr(st, a.r#type)?;
             let mut tc = TC::new(st, kenv, a.level_params.clone());
             check_quot(&mut tc, kind, &a.level_params, ty)?;
-            vec![(a.name, info(&a.level_params, ty, Kind::Quot(kind)))]
+            (vec![(a.name, info(&a.level_params, ty, Kind::Quot(kind)))], None)
         }
         Decl::Inductive(b) => {
             let mut blk = Block { types: Vec::new(), ctors: Vec::new(), recs: Vec::new() };
@@ -799,9 +914,10 @@ fn check_decl(
                 });
             }
             let mut tc = TC::new(st, kenv, Vec::new());
-            inductive::check_block(&mut tc, &env.names, &blk)?
+            (inductive::check_block(&mut tc, &env.names, &blk)?, None)
         }
-    })
+    };
+    Ok((new, t))
 }
 
 fn small(v: u64) -> R<u32> {

@@ -191,6 +191,23 @@ fn parallel_checking_reports_the_earliest_failure() {
 }
 
 #[test]
+fn a_declaration_cannot_use_a_later_one() {
+    // Threads share one table of all constants; each declaration must still
+    // see only those declared before it. Move a theorem that others use
+    // (`Nat.add_comm`) to the end: its first user now refers to a later
+    // constant.
+    let env = parse(CERT.as_bytes()).unwrap();
+    let used = env.find_decl("Nat.add_comm").unwrap();
+    let mut order: Vec<usize> = (0..env.decls.len()).filter(|&i| i != used).collect();
+    order.push(used);
+    let first = certus_kernel::check(&env, &order).unwrap_err().to_string();
+    assert!(first.contains(": unknown constant"), "{first}");
+    for jobs in 2..=8 {
+        assert_eq!(certus_kernel::check_jobs(&env, &order, jobs).unwrap_err().to_string(), first);
+    }
+}
+
+#[test]
 fn verdict_cache_rechecks_only_what_changed() {
     use certus_core::{Decl, cache};
     use std::collections::HashSet;

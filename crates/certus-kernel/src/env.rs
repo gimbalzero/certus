@@ -73,7 +73,7 @@ pub struct ConstInfo {
 /// Names the kernel treats specially (literals, `Nat` acceleration, quotients).
 /// A name that does not occur in the export stays `None`, and the feature
 /// that needs it is off.
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct Builtins {
     pub nat: Option<NameId>,
     pub nat_zero: Option<NameId>,
@@ -169,14 +169,39 @@ impl Builtins {
     }
 }
 
-#[derive(Default)]
+/// Every constant of a check, with the position (in the list of
+/// declarations being checked) of the declaration that added it.
+pub type ConstTable = FxHashMap<NameId, (usize, ConstInfo)>;
+
+/// The environment a declaration is checked in: the constants added by the
+/// declarations before it.
+///
+/// The table may also hold constants of later declarations (when several
+/// threads share one table, see `check::check_jobs`), but only those added at
+/// positions below `visible` can be seen. So a declaration can never refer to
+/// itself or to anything after it.
 pub struct KEnv {
-    pub consts: FxHashMap<NameId, Arc<ConstInfo>>,
+    pub consts: Arc<ConstTable>,
+    pub visible: usize,
     pub builtins: Builtins,
 }
 
+impl Default for KEnv {
+    fn default() -> Self {
+        KEnv { consts: Arc::default(), visible: usize::MAX, builtins: Builtins::default() }
+    }
+}
+
 impl KEnv {
-    pub fn get(&self, n: NameId) -> Option<Arc<ConstInfo>> {
-        self.consts.get(&n).cloned()
+    pub fn get(&self, n: NameId) -> Option<&ConstInfo> {
+        match self.consts.get(&n) {
+            Some((pos, c)) if *pos < self.visible => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Is `n` a constant of this environment?
+    pub fn contains(&self, n: NameId) -> bool {
+        self.consts.get(&n).is_some_and(|(pos, _)| *pos < self.visible)
     }
 }

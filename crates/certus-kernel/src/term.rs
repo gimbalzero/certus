@@ -8,6 +8,7 @@
 use certus_core::export::NameId;
 use num_bigint::BigUint;
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct E(pub u32);
@@ -28,7 +29,10 @@ pub enum Level {
     Param(NameId),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+// `PartialEq` is written out below; it is plain structural equality, so it
+// agrees with the derived `Hash`.
+#[allow(clippy::derived_hash_with_manual_eq)]
+#[derive(Clone, Copy, Eq, Hash, Debug)]
 pub enum Node {
     BVar(u32),
     FVar(u32),
@@ -43,6 +47,24 @@ pub enum Node {
     Proj(NameId, u32, E),
 }
 
+// Written out instead of derived only so that it is always inlined: it runs
+// on every hash-consing lookup.
+impl PartialEq for Node {
+    #[inline(always)]
+    fn eq(&self, o: &Node) -> bool {
+        use Node::*;
+        match (*self, *o) {
+            (BVar(a), BVar(b)) | (FVar(a), FVar(b)) | (Nat(a), Nat(b)) | (Str(a), Str(b)) => a == b,
+            (Sort(a), Sort(b)) => a == b,
+            (Const(a, x), Const(b, y)) => a == b && x == y,
+            (App(a, x), App(b, y)) | (Lam(a, x), Lam(b, y)) | (Pi(a, x), Pi(b, y)) => a == b && x == y,
+            (Let(a, x, p), Let(b, y, q)) => a == b && x == y && p == q,
+            (Proj(a, i, x), Proj(b, j, y)) => a == b && i == j && x == y,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Info {
     /// One more than the largest loose bound variable (0 = closed).
@@ -51,10 +73,12 @@ pub struct Info {
     pub has_lparam: bool,
 }
 
-/// End of a `Store::nat_next` chain.
+/// End of a `nat_next` chain.
 const NO_NAT: u32 = u32::MAX;
 
-pub struct Store {
+/// The interned objects themselves: terms, levels, level lists and literals.
+#[derive(Default)]
+struct Tables {
     nodes: Vec<Node>,
     info: Vec<Info>,
     map: FxHashMap<Node, E>,
@@ -71,6 +95,29 @@ pub struct Store {
     nat_next: Vec<u32>,
     strs: Vec<Box<str>>,
     str_map: FxHashMap<Box<str>, u32>,
+}
+
+/// A frozen store, shared read-only by several [`Store`]s (see [`Store::on`]).
+#[derive(Clone)]
+pub struct Frozen(Arc<Tables>);
+
+/// Hash-consing store.
+///
+/// A store may sit on top of a [`Frozen`] base: every id below the base's
+/// length (of terms, levels, level lists and literals) is the base's, and new
+/// objects get ids from the base's length up. An object is interned in the
+/// base or in the store, never in both, so equal terms still have equal ids.
+/// An object whose parts are not all in the base cannot be in the base, so
+/// only objects built from base parts are looked up there.
+pub struct Store {
+    base: Arc<Tables>,
+    /// Lengths of the base's tables: nodes, levels, lists, nats, strings.
+    nb: u32,
+    lb: u32,
+    sb: u32,
+    natb: u32,
+    strb: u32,
+    own: Tables,
     leq_cache: FxHashMap<(L, L), bool>,
     /// Interned lists of universe parameter names (keys of `ilp_cache`).
     name_lists: FxHashMap<Box<[NameId]>, u32>,
@@ -107,20 +154,25 @@ impl Default for Store {
 
 impl Store {
     pub fn new() -> Self {
+        Self::on_tables(Arc::new(Tables::default()))
+    }
+
+    /// An empty store on top of `base`: every object of `base` is available
+    /// under its id there.
+    pub fn on(base: &Frozen) -> Self {
+        Self::on_tables(base.0.clone())
+    }
+
+    fn on_tables(base: Arc<Tables>) -> Self {
+        let len = |n: usize| u32::try_from(n).expect("base store too large");
         let mut s = Store {
-            nodes: Vec::new(),
-            info: Vec::new(),
-            map: FxHashMap::default(),
-            levels: Vec::new(),
-            level_has_param: Vec::new(),
-            lmap: FxHashMap::default(),
-            lists: Vec::new(),
-            list_map: FxHashMap::default(),
-            nats: Vec::new(),
-            nat_map: FxHashMap::default(),
-            nat_next: Vec::new(),
-            strs: Vec::new(),
-            str_map: FxHashMap::default(),
+            nb: len(base.nodes.len()),
+            lb: len(base.levels.len()),
+            sb: len(base.lists.len()),
+            natb: len(base.nats.len()),
+            strb: len(base.strs.len()),
+            base,
+            own: Tables::default(),
             leq_cache: FxHashMap::default(),
             name_lists: FxHashMap::default(),
             ilp_cache: FxHashMap::default(),
@@ -134,34 +186,62 @@ impl Store {
         s
     }
 
+    /// Freeze this store, so that other stores can share its objects. Only a
+    /// store without a base can be frozen.
+    pub fn freeze(self) -> Frozen {
+        assert!(self.nb == 0 && self.lb == 0 && self.sb == 0 && self.natb == 0 && self.strb == 0);
+        Frozen(Arc::new(self.own))
+    }
+
     pub fn num_nodes(&self) -> usize {
-        self.nodes.len()
+        self.nb as usize + self.own.nodes.len()
+    }
+
+    #[inline(always)]
+    fn has_param(&self, l: L) -> bool {
+        match self.own.level_has_param.get(l.0.wrapping_sub(self.lb) as usize) {
+            Some(&x) => x,
+            None => self.base.level_has_param[l.0 as usize],
+        }
     }
 
     // ---------- levels ----------
 
     /// Intern a level exactly as given (no simplification).
     pub fn level(&mut self, l: Level) -> L {
-        if let Some(&x) = self.lmap.get(&l) {
+        let in_base = match l {
+            Level::Zero | Level::Param(_) => true,
+            Level::Succ(a) => a.0 < self.lb,
+            Level::Max(a, b) | Level::IMax(a, b) => a.0 < self.lb && b.0 < self.lb,
+        };
+        if self.lb != 0
+            && in_base
+            && let Some(&x) = self.base.lmap.get(&l)
+        {
+            return x;
+        }
+        if let Some(&x) = self.own.lmap.get(&l) {
             return x;
         }
         let hp = match l {
             Level::Zero => false,
             Level::Param(_) => true,
-            Level::Succ(a) => self.level_has_param[a.0 as usize],
-            Level::Max(a, b) | Level::IMax(a, b) => {
-                self.level_has_param[a.0 as usize] || self.level_has_param[b.0 as usize]
-            }
+            Level::Succ(a) => self.has_param(a),
+            Level::Max(a, b) | Level::IMax(a, b) => self.has_param(a) || self.has_param(b),
         };
-        let id = L(self.levels.len() as u32);
-        self.levels.push(l);
-        self.level_has_param.push(hp);
-        self.lmap.insert(l, id);
+        let id = L(self.lb + self.own.levels.len() as u32);
+        self.own.levels.push(l);
+        self.own.level_has_param.push(hp);
+        self.own.lmap.insert(l, id);
         id
     }
 
+    #[inline(always)]
     pub fn lnode(&self, l: L) -> Level {
-        self.levels[l.0 as usize]
+        match self.own.levels.get(l.0.wrapping_sub(self.lb) as usize) {
+            Some(&x) => x,
+            None => self.base.levels[l.0 as usize],
+        }
     }
 
     pub fn succ(&mut self, l: L) -> L {
@@ -190,17 +270,27 @@ impl Store {
     }
 
     pub fn list(&mut self, ls: &[L]) -> Ls {
-        if let Some(&x) = self.list_map.get(ls) {
+        if self.sb != 0
+            && ls.iter().all(|l| l.0 < self.lb)
+            && let Some(&x) = self.base.list_map.get(ls)
+        {
             return x;
         }
-        let id = Ls(self.lists.len() as u32);
-        self.lists.push(ls.into());
-        self.list_map.insert(ls.into(), id);
+        if let Some(&x) = self.own.list_map.get(ls) {
+            return x;
+        }
+        let id = Ls(self.sb + self.own.lists.len() as u32);
+        self.own.lists.push(ls.into());
+        self.own.list_map.insert(ls.into(), id);
         id
     }
 
+    #[inline]
     pub fn list_of(&self, ls: Ls) -> &[L] {
-        &self.lists[ls.0 as usize]
+        match self.own.lists.get(ls.0.wrapping_sub(self.sb) as usize) {
+            Some(x) => x,
+            None => &self.base.lists[ls.0 as usize],
+        }
     }
 
     pub fn level_params(&self, l: L, out: &mut Vec<NameId>) {
@@ -220,7 +310,7 @@ impl Store {
     }
 
     pub fn instantiate_level(&mut self, l: L, ps: &[NameId], ls: &[L]) -> L {
-        if !self.level_has_param[l.0 as usize] {
+        if !self.has_param(l) {
             return l;
         }
         match self.lnode(l) {
@@ -308,20 +398,51 @@ impl Store {
 
     // ---------- terms ----------
 
+    /// `n`, if it is interned in the base.
+    #[inline(never)]
+    fn in_base(&self, n: Node) -> Option<E> {
+        let b = |e: E| e.0 < self.nb;
+        let parts_in_base = match n {
+            Node::BVar(_) | Node::FVar(_) => true,
+            Node::Sort(l) => l.0 < self.lb,
+            Node::Const(_, ls) => ls.0 < self.sb,
+            Node::App(f, a) | Node::Lam(f, a) | Node::Pi(f, a) => b(f) && b(a),
+            Node::Let(t, v, x) => b(t) && b(v) && b(x),
+            Node::Nat(i) => i < self.natb,
+            Node::Str(i) => i < self.strb,
+            Node::Proj(_, _, x) => b(x),
+        };
+        if parts_in_base { self.base.map.get(&n).copied() } else { None }
+    }
+
     pub fn mk(&mut self, n: Node) -> E {
-        if let Some(&e) = self.map.get(&n) {
+        if self.nb != 0
+            && let Some(e) = self.in_base(n)
+        {
             return e;
         }
-        let i = |s: &Self, e: E| s.info[e.0 as usize];
-        let info = match n {
+        if let Some(&e) = self.own.map.get(&n) {
+            return e;
+        }
+        let info = self.node_info(n);
+        let id = self.nb as usize + self.own.nodes.len();
+        let e = E(u32::try_from(id).expect("term store full"));
+        self.own.nodes.push(n);
+        self.own.info.push(info);
+        self.own.map.insert(n, e);
+        e
+    }
+
+    #[inline]
+    fn node_info(&self, n: Node) -> Info {
+        let i = |s: &Self, e: E| s.info(e);
+        match n {
             Node::BVar(k) => Info { lbr: k + 1, has_fvar: false, has_lparam: false },
             Node::FVar(_) => Info { lbr: 0, has_fvar: true, has_lparam: false },
-            Node::Sort(l) => Info { lbr: 0, has_fvar: false, has_lparam: self.level_has_param[l.0 as usize] },
-            Node::Const(_, ls) => Info {
-                lbr: 0,
-                has_fvar: false,
-                has_lparam: self.lists[ls.0 as usize].iter().any(|l| self.level_has_param[l.0 as usize]),
-            },
+            Node::Sort(l) => Info { lbr: 0, has_fvar: false, has_lparam: self.has_param(l) },
+            Node::Const(_, ls) => {
+                Info { lbr: 0, has_fvar: false, has_lparam: self.list_of(ls).iter().any(|&l| self.has_param(l)) }
+            }
             Node::App(f, a) => {
                 let (x, y) = (i(self, f), i(self, a));
                 Info {
@@ -348,51 +469,62 @@ impl Store {
             }
             Node::Nat(_) | Node::Str(_) => Info { lbr: 0, has_fvar: false, has_lparam: false },
             Node::Proj(_, _, x) => i(self, x),
-        };
-        let e = E(self.nodes.len() as u32);
-        self.nodes.push(n);
-        self.info.push(info);
-        self.map.insert(n, e);
-        e
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn node(&self, e: E) -> Node {
-        self.nodes[e.0 as usize]
+        // Ids below the base's length wrap around to indices past the end.
+        match self.own.nodes.get(e.0.wrapping_sub(self.nb) as usize) {
+            Some(&x) => x,
+            None => self.base.nodes[e.0 as usize],
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn info(&self, e: E) -> Info {
-        self.info[e.0 as usize]
+        // Ids below the base's length wrap around to indices past the end.
+        match self.own.info.get(e.0.wrapping_sub(self.nb) as usize) {
+            Some(&x) => x,
+            None => self.base.info[e.0 as usize],
+        }
     }
 
     pub fn nat(&mut self, n: BigUint) -> E {
         use std::hash::BuildHasher;
         let h = rustc_hash::FxBuildHasher.hash_one(&n);
-        let mut cur = self.nat_map.get(&h).copied().unwrap_or(NO_NAT);
-        while cur != NO_NAT {
-            if self.nats[cur as usize] == n {
-                return self.mk(Node::Nat(cur));
+        // Base literals have indices below `natb`, this store's from `natb` up;
+        // each table's chain holds its own indices.
+        let find = |t: &Tables| {
+            let mut cur = t.nat_map.get(&h).copied().unwrap_or(NO_NAT);
+            while cur != NO_NAT && t.nats[cur as usize] != n {
+                cur = t.nat_next[cur as usize];
             }
-            cur = self.nat_next[cur as usize];
+            (cur != NO_NAT).then_some(cur)
+        };
+        if let Some(i) = find(&self.base) {
+            return self.mk(Node::Nat(i));
         }
-        let i = self.nats.len() as u32;
-        self.nats.push(n);
-        self.nat_next.push(self.nat_map.insert(h, i).unwrap_or(NO_NAT));
-        self.mk(Node::Nat(i))
+        if let Some(i) = find(&self.own) {
+            return self.mk(Node::Nat(self.natb + i));
+        }
+        let i = self.own.nats.len() as u32;
+        self.own.nats.push(n);
+        self.own.nat_next.push(self.own.nat_map.insert(h, i).unwrap_or(NO_NAT));
+        self.mk(Node::Nat(self.natb + i))
     }
 
     pub fn nat_val(&self, i: u32) -> &BigUint {
-        &self.nats[i as usize]
+        if i < self.natb { &self.base.nats[i as usize] } else { &self.own.nats[(i - self.natb) as usize] }
     }
 
     pub fn str_lit(&mut self, s: &str) -> E {
-        let i = match self.str_map.get(s) {
+        let i = match self.base.str_map.get(s).or_else(|| self.own.str_map.get(s)) {
             Some(&i) => i,
             None => {
-                let i = self.strs.len() as u32;
-                self.strs.push(s.into());
-                self.str_map.insert(s.into(), i);
+                let i = self.strb + self.own.strs.len() as u32;
+                self.own.strs.push(s.into());
+                self.own.str_map.insert(s.into(), i);
                 i
             }
         };
@@ -400,7 +532,7 @@ impl Store {
     }
 
     pub fn str_val(&self, i: u32) -> &str {
-        &self.strs[i as usize]
+        if i < self.strb { &self.base.strs[i as usize] } else { &self.own.strs[(i - self.strb) as usize] }
     }
 
     pub fn sort(&mut self, l: L) -> E {
@@ -791,7 +923,53 @@ mod tests {
         assert_eq!(st.nat(big.clone()), a);
         assert_eq!(st.nat(big + 1u32), b);
         assert_eq!(st.nat(BigUint::from(0u32)), st.nat(BigUint::from(0u32)));
-        assert_eq!(st.nats.len(), 3, "each value is stored once");
+        assert_eq!(st.own.nats.len(), 3, "each value is stored once");
+    }
+
+    #[test]
+    fn overlay_store_shares_the_base_and_keeps_ids_canonical() {
+        let mut b = Store::new();
+        let u = b.level(Level::Param(7));
+        let su = b.sort(u);
+        let c = b.cnst(3, &[u]);
+        let app = b.app(c, su);
+        let big = b.nat(BigUint::from(10u32).pow(40));
+        let s = b.str_lit("hi");
+        let n = b.num_nodes();
+        let base = b.freeze();
+        let mut x = Store::on(&base);
+        let mut y = Store::on(&base);
+        for st in [&mut x, &mut y] {
+            // Objects of the base keep their ids.
+            let u2 = st.level(Level::Param(7));
+            assert_eq!(u2, u);
+            assert_eq!(st.sort(u2), su);
+            let c2 = st.cnst(3, &[u2]);
+            assert_eq!(c2, c);
+            assert_eq!(st.app(c2, su), app);
+            assert_eq!(st.nat(BigUint::from(10u32).pow(40)), big);
+            assert_eq!(st.str_lit("hi"), s);
+            assert_eq!(st.node(app), Node::App(c, su));
+            // New objects get new ids, past the base, and are interned too.
+            let v = st.succ(u);
+            let sv = st.sort(v);
+            assert!(sv.0 as usize >= n);
+            assert_eq!(st.sort(v), sv);
+            let a2 = st.app(app, sv);
+            assert_eq!(st.app(app, sv), a2);
+            assert_eq!(st.node(a2), Node::App(app, sv));
+            let m = st.nat(BigUint::from(5u32));
+            assert_eq!(st.nat(BigUint::from(5u32)), m);
+            let Node::Nat(i) = st.node(m) else { panic!() };
+            assert_eq!(st.nat_val(i), &BigUint::from(5u32));
+            let t = st.str_lit("new");
+            let Node::Str(j) = st.node(t) else { panic!() };
+            assert_eq!(st.str_val(j), "new");
+            assert!(st.info(sv).has_lparam && st.info(a2).has_lparam);
+            let su2 = st.instantiate_lparams(sv, &[7], &[st.zero]);
+            let one = st.succ(st.zero);
+            assert_eq!(su2, st.sort(one));
+        }
     }
 
     #[test]
