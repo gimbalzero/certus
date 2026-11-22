@@ -1,6 +1,6 @@
 //! `certus`: inspect Lean 4 kernel exports produced by `lean4export`.
 
-use certus_core::{Env, deps, hash, parse, pretty};
+use certus_core::{Decl, Env, deps, hash, parse, pretty, report};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -36,6 +36,11 @@ USAGE:
         for byte, is not even parsed again (see docs/CACHE.md).
         --cache DIR: keep the cache in DIR (default: $XDG_CACHE_HOME/certus
         or ~/.cache/certus); --no-cache: neither read nor write it.
+        --report FILE: write an audit report (JSON): the checker build, the
+        export's hash, the verdict, and for each named declaration its exact
+        statement, a hash of it, and the axioms and unsafe or partial
+        declarations it rests on. The same build checking the same export
+        writes the same report, byte for byte (docs/AUDIT.md).
         Exit code 0: all accepted; 1: REJECTED (invalid) or other error;
         2: DECLINED (ran out of work budget or stack before a verdict).
     certus extract <export.ndjson> <out.ndjson> <Decl.Name>...
@@ -44,8 +49,7 @@ USAGE:
 
 Exports come from lean4export (format 3.x).";
 
-/// The axioms accepted by Mathlib and by Lean's own checkers.
-const STANDARD_AXIOMS: [&str; 3] = ["propext", "Classical.choice", "Quot.sound"];
+use certus_core::report::STANDARD_AXIOMS;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -320,9 +324,12 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
     let mut names: Vec<String> = Vec::new();
     let mut jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut cache_dir = default_cache_dir();
+    let mut report: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--jobs" || a == "-j" {
+        if a == "--report" {
+            report = Some(it.next().ok_or("--report needs a file")?.clone());
+        } else if a == "--jobs" || a == "-j" {
             let n = it.next().ok_or("--jobs needs a number")?;
             jobs = n
                 .parse()
@@ -339,7 +346,8 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
     }
     let names = &names[..];
     let mut cache = cache_dir.and_then(VerdictCache::open);
-    if let Some(c) = &cache {
+    // A report needs the parsed export, so it skips the whole-export shortcut.
+    if let Some(c) = cache.as_ref().filter(|_| report.is_none()) {
         // An export accepted before, byte for byte, by this same build and for
         // the same targets: nothing to parse or check.
         let t = Instant::now();
@@ -354,11 +362,14 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
         }
     }
     let (env, bytes) = load_hashed(path)?;
-    let decls: Vec<usize> = if names.is_empty() {
-        (0..env.decls.len()).collect()
-    } else {
-        let roots = resolve(&env, names)?;
-        deps::closure(&env, &roots).decls
+    let roots = resolve(&env, names)?;
+    let decls: Vec<usize> =
+        if names.is_empty() { (0..env.decls.len()).collect() } else { deps::closure(&env, &roots).decls };
+    let write_report = |verdict: report::Verdict, from_cache: usize| -> Result<(), String> {
+        let Some(out) = &report else { return Ok(()) };
+        let checker = checker_id().ok_or("--report: cannot read the certus executable to identify the build")?;
+        let r = report::build(&env, &roots, &checker, &bytes, verdict, from_cache);
+        std::fs::write(out, report::to_json(&r)).map_err(|e| format!("{out}: {e}"))
     };
     if let Some(c) = &mut cache {
         c.keys = certus_core::cache::keys(&env, &c.checker);
@@ -372,6 +383,8 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
         // Every declaration, inductive types included, was accepted before
         // with exactly this content and these dependencies.
         println!("OK: {} declarations type-checked (all known good from the verdict cache)", decls.len());
+        let admitted = decls.iter().filter(|&&i| !matches!(env.decls[i], Decl::Inductive(_) | Decl::Quot(_))).count();
+        write_report(report::Verdict::Accepted, admitted)?;
         if let Some(c) = &cache
             && let Err(e) = c.remember(&[])
         {
@@ -381,9 +394,16 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
     }
     let r = match certus_kernel::check_with(&env, &decls, jobs, &known) {
         Ok(r) => r,
-        Err(e) if e.resource => return Ok(Err(format!("DECLINED {e} (no verdict: out of resources)"))),
-        Err(e) => return Err(format!("REJECTED {e}")),
+        Err(e) if e.resource => {
+            write_report(report::Verdict::Declined(e.to_string()), 0)?;
+            return Ok(Err(format!("DECLINED {e} (no verdict: out of resources)")));
+        }
+        Err(e) => {
+            write_report(report::Verdict::Rejected(e.to_string()), 0)?;
+            return Err(format!("REJECTED {e}"));
+        }
     };
+    write_report(report::Verdict::Accepted, r.from_cache)?;
     if let Some(c) = &cache
         && let Err(e) = c.remember(&decls)
     {

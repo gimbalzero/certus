@@ -8,6 +8,7 @@ pub mod deps;
 pub mod export;
 pub mod hash;
 pub mod pretty;
+pub mod report;
 pub mod write;
 
 pub use export::{Decl, Env, Expr, Level, Name, ParseError, parse};
