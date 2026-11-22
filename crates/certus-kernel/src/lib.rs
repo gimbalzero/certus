@@ -22,3 +22,5 @@ pub mod term;
 
 pub use check::{CheckError, Report, check, check_jobs, check_with};
 pub use tc::KError;
+#[doc(hidden)]
+pub use tc::set_collect_threshold_for_tests;
