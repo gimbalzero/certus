@@ -30,6 +30,11 @@ USAGE:
         exactly what those declarations depend on; without, check everything.
         --jobs N: use N threads (default: all cores); the verdict is the same
         for every N.
+        Accepted declarations are remembered in a verdict cache, keyed on
+        their content and everything they depend on, so an unchanged
+        declaration is not checked again (see docs/CACHE.md).
+        --cache DIR: keep the cache in DIR (default: $XDG_CACHE_HOME/certus
+        or ~/.cache/certus); --no-cache: neither read nor write it.
         Exit code 0: all accepted; 1: REJECTED (invalid) or other error;
         2: DECLINED (ran out of work budget or stack before a verdict).
     certus extract <export.ndjson> <out.ndjson> <Decl.Name>...
@@ -256,6 +261,7 @@ fn resolve(env: &Env, names: &[String]) -> Result<Vec<usize>, String> {
 fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> {
     let mut names: Vec<String> = Vec::new();
     let mut jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut cache_dir = default_cache_dir();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--jobs" || a == "-j" {
@@ -265,6 +271,10 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
                 .ok()
                 .filter(|&n: &usize| n > 0)
                 .ok_or_else(|| format!("--jobs: not a positive number: {n}"))?;
+        } else if a == "--cache" {
+            cache_dir = Some(it.next().ok_or("--cache needs a directory")?.into());
+        } else if a == "--no-cache" {
+            cache_dir = None;
         } else {
             names.push(a.clone());
         }
@@ -277,11 +287,27 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
         let roots = resolve(&env, names)?;
         deps::closure(&env, &roots).decls
     };
-    let r = match certus_kernel::check_jobs(&env, &decls, jobs) {
+    let cache = cache_dir.and_then(|dir| VerdictCache::open(dir, &env));
+    let known: Vec<bool> = match &cache {
+        Some(c) => decls.iter().map(|&i| c.is_known(i)).collect(),
+        None => Vec::new(),
+    };
+    if !known.is_empty() && known.iter().all(|&k| k) {
+        // Every declaration, inductive types included, was accepted before
+        // with exactly this content and these dependencies.
+        println!("OK: {} declarations type-checked (all known good from the verdict cache)", decls.len());
+        return Ok(Ok(()));
+    }
+    let r = match certus_kernel::check_with(&env, &decls, jobs, &known) {
         Ok(r) => r,
         Err(e) if e.resource => return Ok(Err(format!("DECLINED {e} (no verdict: out of resources)"))),
         Err(e) => return Err(format!("REJECTED {e}")),
     };
+    if let Some(c) = &cache
+        && let Err(e) = c.remember(&decls)
+    {
+        eprintln!("warning: could not write the verdict cache: {e}");
+    }
     let kinds: Vec<String> = r.by_kind.iter().map(|(k, n)| format!("{n} {k}")).collect();
     println!(
         "OK: {} declarations type-checked in {:.3} s on {} thread{} ({})",
@@ -291,11 +317,78 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
         if r.threads == 1 { "" } else { "s" },
         kinds.join(", ")
     );
+    if r.from_cache > 0 {
+        println!("{} of them known good from the verdict cache", r.from_cache);
+    }
     println!("term nodes: {}; Nat operations verified for native arithmetic: {}", r.term_nodes, r.native_nat_ops);
     for (n, t) in &r.slowest {
         println!("  {:>9.3} ms  {n}", t.as_secs_f64() * 1e3);
     }
     Ok(Ok(()))
+}
+
+fn default_cache_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cache")))?;
+    Some(base.join("certus"))
+}
+
+/// The per-declaration verdict cache (issue #9, docs/CACHE.md): one line per
+/// accepted declaration in `verdicts-v1.log`, each holding the declaration's
+/// key (`certus_core::cache`) and a check value. Unreadable, malformed or
+/// mismatching lines are ignored: they can only cause a re-check.
+struct VerdictCache {
+    file: std::path::PathBuf,
+    keys: Vec<Option<hash::Hash>>,
+    known: HashSet<hash::Hash>,
+}
+
+impl VerdictCache {
+    fn open(dir: std::path::PathBuf, env: &Env) -> Option<Self> {
+        let file = dir.join("verdicts-v1.log");
+        let keys = certus_core::cache::keys(env, &checker_id()?);
+        let known = std::fs::read_to_string(&file)
+            .map(|s| s.lines().filter_map(certus_core::cache::parse_entry).collect())
+            .unwrap_or_default();
+        Some(VerdictCache { file, keys, known })
+    }
+
+    fn is_known(&self, decl: usize) -> bool {
+        self.keys[decl].is_some_and(|k| self.known.contains(&k))
+    }
+
+    /// Record that every declaration in `decls` was accepted.
+    fn remember(&self, decls: &[usize]) -> std::io::Result<()> {
+        let mut new = String::new();
+        for &i in decls {
+            if let Some(k) = &self.keys[i]
+                && !self.known.contains(k)
+            {
+                new.push_str(&certus_core::cache::entry(k));
+                new.push('\n');
+            }
+        }
+        if new.is_empty() {
+            return Ok(());
+        }
+        if let Some(dir) = self.file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // One append of whole lines; a torn write only produces lines that
+        // fail their check and are ignored.
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.file)?;
+        f.write_all(new.as_bytes())
+    }
+}
+
+/// Identifies this exact checker build: the hash of the running executable,
+/// so a rebuilt checker never reuses verdicts from another build. `None` if
+/// the executable cannot be read (then the cache is not used).
+fn checker_id() -> Option<hash::Hash> {
+    let bytes = std::env::current_exe().and_then(std::fs::read).ok()?;
+    Some(*blake3::Hasher::new_derive_key("certus verdict cache v1 checker id").update(&bytes).finalize().as_bytes())
 }
 
 fn extract_cmd(path: &str, out: &str, names: &[String]) -> Result<(), String> {

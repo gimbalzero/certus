@@ -282,3 +282,89 @@ fn lazy_hashes_match_full_hashes() {
         }
     }
 }
+
+mod verdict_cache {
+    use super::*;
+    use certus_core::cache;
+
+    const CHECKER: [u8; 32] = [7; 32];
+
+    fn keys(src: &str) -> (Env, Vec<Option<hash::Hash>>) {
+        let env = env_of(src);
+        let k = cache::keys(&env, &CHECKER);
+        (env, k)
+    }
+
+    fn key(src: &str, name: &str) -> Option<hash::Hash> {
+        let (env, k) = keys(src);
+        k[env.find_decl(name).unwrap()]
+    }
+
+    #[test]
+    fn changing_a_declaration_changes_exactly_it_and_its_dependents() {
+        // TINY: P; myAx : P; myThm : P := myAx; unused := P.
+        // Changing myAx's unsafe flag changes myAx and myThm, not P or unused.
+        let changed = TINY.replacen(
+            "\"isUnsafe\":false,\"levelParams\":[],\"name\":2",
+            "\"isUnsafe\":true,\"levelParams\":[],\"name\":2",
+            1,
+        );
+        assert_ne!(changed, TINY);
+        for (name, same) in [("P", true), ("unused", true), ("myAx", false), ("myThm", false)] {
+            assert_eq!(key(TINY, name) == key(&changed, name), same, "{name}");
+        }
+        assert!(keys(TINY).1.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn keys_ignore_binder_names_and_export_order() {
+        let renamed = ALPHA.replace("\"str\":\"x\"", "\"str\":\"z\"");
+        assert_eq!(key(ALPHA, "ax1"), key(&renamed, "ax1"));
+        for name in ["alphaT1", "alphaT2"] {
+            assert_eq!(key(ORDER_12, name), key(ORDER_21, name), "{name}");
+        }
+    }
+
+    #[test]
+    fn keys_depend_on_the_checker() {
+        let env = env_of(TINY);
+        assert_ne!(cache::keys(&env, &[1; 32]), cache::keys(&env, &[2; 32]));
+    }
+
+    #[test]
+    fn a_reference_to_a_later_declaration_has_no_key() {
+        // Move P's axiom to the end: myAx now refers forward, so neither it
+        // nor myThm (which depends on it) can be cached.
+        let mut lines: Vec<&str> = TINY.lines().collect();
+        let p = lines.iter().position(|l| l.starts_with("{\"axiom\"") && l.contains("\"name\":1,")).unwrap();
+        let ax = lines.remove(p);
+        lines.push(ax);
+        let moved: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        assert_eq!(key(&moved, "myAx"), None);
+        assert_eq!(key(&moved, "myThm"), None);
+        assert!(key(&moved, "P").is_some());
+    }
+
+    #[test]
+    fn string_literals_depend_on_the_expansion_function_only() {
+        // In Lean 4.36 `String.mk` is a deprecated alias declared after the
+        // first string literals; only `String.ofList` is an implicit dependency.
+        let src = include_str!("../../certus-kernel/tests/fixtures/string_literals.ndjson");
+        let (env, k) = keys(src);
+        for (i, key) in k.iter().enumerate() {
+            assert!(key.is_some(), "{} has no key", env.name_str(env.decls[i].primary_name()));
+        }
+    }
+
+    #[test]
+    fn entries_are_checked() {
+        let k = [42u8; 32];
+        let e = cache::entry(&k);
+        assert_eq!(cache::parse_entry(&e), Some(k));
+        let mut bad = e.clone();
+        bad.replace_range(0..1, if e.starts_with('0') { "1" } else { "0" });
+        assert_eq!(cache::parse_entry(&bad), None, "changed key");
+        assert_eq!(cache::parse_entry(&e[..e.len() - 1]), None, "truncated");
+        assert_eq!(cache::parse_entry("garbage"), None);
+    }
+}

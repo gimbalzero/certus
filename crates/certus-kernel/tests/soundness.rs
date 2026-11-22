@@ -189,3 +189,42 @@ fn parallel_checking_reports_the_earliest_failure() {
         assert_eq!(certus_kernel::check_jobs(&env, &all, jobs).unwrap_err().to_string(), first);
     }
 }
+
+#[test]
+fn verdict_cache_rechecks_only_what_changed() {
+    use certus_core::{Decl, cache};
+    use std::collections::HashSet;
+    let checker = [9u8; 32];
+    let old = parse(CERT.as_bytes()).unwrap();
+    let old_keys: HashSet<_> = cache::keys(&old, &checker).into_iter().flatten().collect();
+    assert_eq!(old_keys.len(), old.decls.len(), "every declaration is cacheable");
+
+    // Change one definition in a way that keeps it valid.
+    let mut c = Cert::load();
+    let d = c.find("def", "sumTo");
+    c.lines[d]["def"]["hints"] = serde_json::json!({"regular": 9});
+    let text = c.text();
+    let new = parse(text.as_bytes()).unwrap();
+    let keys = cache::keys(&new, &checker);
+    let all: Vec<usize> = (0..new.decls.len()).collect();
+    let known: Vec<bool> = keys.iter().map(|k| k.is_some_and(|k| old_keys.contains(&k))).collect();
+
+    // Exactly sumTo and what depends on it get new keys.
+    let sum_to = new.find_decl("sumTo").unwrap();
+    let changed: Vec<String> =
+        all.iter().filter(|&&i| !known[i]).map(|&i| new.name_str(new.decls[i].primary_name())).collect();
+    let dependents: Vec<String> = all
+        .iter()
+        .filter(|&&i| deps::closure(&new, &[i]).decls.contains(&sum_to))
+        .map(|&i| new.name_str(new.decls[i].primary_name()))
+        .collect();
+    assert_eq!(changed, dependents);
+    assert!(changed.len() >= 2 && changed.len() < 10, "{changed:?}");
+
+    for jobs in [1, 4] {
+        let r = certus_kernel::check_with(&new, &all, jobs, &known).unwrap();
+        let cached_kinds =
+            all.iter().filter(|&&i| known[i] && !matches!(new.decls[i], Decl::Inductive(_) | Decl::Quot(_)));
+        assert_eq!(r.from_cache, cached_kinds.count());
+    }
+}

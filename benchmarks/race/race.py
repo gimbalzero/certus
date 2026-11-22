@@ -218,7 +218,7 @@ def tamper_suite(work, cert):
         mutate(c)
         path = os.path.join(work, "tampered.ndjson")
         c.write(path)
-        code, out, _, _ = run_once([CERTUS, "check", path, THM1], None, None)
+        code, out, _, _ = run_once([CERTUS, "check", path, THM1, "--no-cache"], None, None)
         rejected = code != 0
         last = out.strip().splitlines()[-1] if out.strip() else ""
         results.append({"tamper": why, "rejected": rejected, "message": last})
@@ -282,7 +282,7 @@ def main():
     # (tool, name, cmd, cwd, check)
     rounds = {
         "1 theorem": [
-            ("certus", "Certus (certificate)", [CERTUS, "check", cert1], None, ok_certus),
+            ("certus", "Certus (certificate)", [CERTUS, "check", cert1, "--no-cache"], None, ok_certus),
             ("nanoda", "nanoda (certificate)", ["nanoda_bin", nanoda_config(work, cert1)], None, ok_nanoda),
             ("con-leche", "con-leche (certificate)", ["con-leche", cert1], None, ok_leche),
             ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", "Sum"], LEAN_DIR,
@@ -290,7 +290,7 @@ def main():
             ("lean", "Lean, build from source", ["lean", "Sum.lean"], LEAN_DIR, ok_any),
         ],
         "1,000 theorems": [
-            ("certus", "Certus (certificate)", [CERTUS, "check", cert2], None, ok_certus),
+            ("certus", "Certus (certificate)", [CERTUS, "check", cert2, "--no-cache"], None, ok_certus),
             ("nanoda", "nanoda (certificate)", ["nanoda_bin", nanoda_config(work, cert2)], None, ok_nanoda),
             ("con-leche", "con-leche (certificate)", ["con-leche", cert2], None, ok_leche),
             ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", gen2],
@@ -302,7 +302,7 @@ def main():
         # Sum.lean holds both proofs, so leanchecker and the Lean build do the
         # same work in rounds 1 and 3.
         "1 theorem, automated": [
-            ("certus", "Certus (certificate)", [CERTUS, "check", cert3], None, ok_certus),
+            ("certus", "Certus (certificate)", [CERTUS, "check", cert3, "--no-cache"], None, ok_certus),
             ("nanoda", "nanoda (certificate)", ["nanoda_bin", nanoda_config(work, cert3)], None, ok_nanoda),
             ("con-leche", "con-leche (certificate)", ["con-leche", cert3], None, ok_leche),
             ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", "Sum"], LEAN_DIR,
@@ -312,7 +312,7 @@ def main():
         # Metamath is a whole-library reference, not a check of this proof, so
         # it runs once, in round 2.
         "1,000 theorems, automated": [
-            ("certus", "Certus (certificate)", [CERTUS, "check", cert4], None, ok_certus),
+            ("certus", "Certus (certificate)", [CERTUS, "check", cert4, "--no-cache"], None, ok_certus),
             ("nanoda", "nanoda (certificate)", ["nanoda_bin", nanoda_config(work, cert4)], None, ok_nanoda),
             ("con-leche", "con-leche (certificate)", ["con-leche", cert4], None, ok_leche),
             ("leanchecker", "Lean kernel replay, trusts imports (leanchecker)", ["leanchecker", gen4],

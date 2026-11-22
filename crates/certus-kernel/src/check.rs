@@ -49,6 +49,8 @@ pub struct Report {
     pub native_nat_ops: usize,
     /// Worker threads used.
     pub threads: usize,
+    /// Declarations admitted as known good (from the verdict cache), not type-checked.
+    pub from_cache: usize,
 }
 
 struct Conv<'x> {
@@ -146,13 +148,33 @@ pub fn check(env: &Env, decls: &[usize]) -> Result<Report, CheckError> {
 /// reported ahead of an earlier one. Once a failure is known, workers stop
 /// at that position.
 pub fn check_jobs(env: &Env, decls: &[usize], jobs: usize) -> Result<Report, CheckError> {
+    check_with(env, decls, jobs, &[])
+}
+
+/// [`check_jobs`], except that the definitions, theorems, opaques and axioms
+/// at the positions `p` with `known_good[p]` are admitted without being
+/// type-checked, because an earlier run already accepted exactly that
+/// declaration with exactly these dependencies (the verdict cache keys them
+/// so, see `certus_core::cache`). Inductive types and quotients are always
+/// checked: each run needs their recursors and rules. An empty `known_good`
+/// means none.
+pub fn check_with(env: &Env, decls: &[usize], jobs: usize, known_good: &[bool]) -> Result<Report, CheckError> {
     let start = Instant::now();
+    if !known_good.is_empty() && known_good.len() != decls.len() {
+        return Err(CheckError {
+            decl: String::new(),
+            msg: "internal: known_good has the wrong length".into(),
+            resource: false,
+        });
+    }
+    let known = |p: usize| known_good.get(p).copied().unwrap_or(false);
     let prep = Prep::new(env);
     let jobs = jobs.clamp(1, decls.len().max(1));
     let shared = Shared {
-        claimed: (0..decls.len()).map(|_| AtomicBool::new(false)).collect(),
+        // Known-good declarations count as claimed, so no worker checks them.
+        claimed: (0..decls.len()).map(|p| AtomicBool::new(known(p))).collect(),
         first_failure: AtomicUsize::new(usize::MAX),
-        parallel: jobs > 1,
+        parallel: jobs > 1 || !known_good.is_empty(),
     };
     let outs: Vec<Worker> = std::thread::scope(|s| {
         let mut handles = Vec::new();
@@ -197,6 +219,11 @@ pub fn check_jobs(env: &Env, decls: &[usize], jobs: usize) -> Result<Report, Che
         term_nodes: outs.iter().map(|w| w.term_nodes).sum(),
         native_nat_ops: first.native_nat_ops,
         threads: outs.len(),
+        from_cache: decls
+            .iter()
+            .enumerate()
+            .filter(|&(p, &i)| known(p) && !matches!(env.decls[i], Decl::Inductive(_) | Decl::Quot(_)))
+            .count(),
     })
 }
 
