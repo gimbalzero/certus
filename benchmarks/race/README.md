@@ -34,11 +34,27 @@ Each copy has its own recursive definition, so this is 1,000 definitions and 1,0
 3. **Certus only accepts what all three agree on.** nanoda and con-leche both accept the same certificates. Certus also rejects all seven tampered versions in its test suite: a wrong proof, a changed statement, a missing definition, a forged recursor, data posing as a theorem, an injected field, and a `partial` definition.
 4. **Lean's own checkers trust their imports.** `leanchecker` and the Lean build re-check only the file's own declarations and load the rest from `.olean` files. Certus re-checks everything the theorem depends on, and is still faster.
 
+## Other provers: Rocq, Agda, Isabelle, HOL Light
+
+The same theorem, written natively in each system under `benchmarks/race/<system>/` (`Sum.*`, plus `gen.py` for the 1,000-copy file, each copy with its own recursive definition). Each one needs GBs of disk, so `.github/workflows/race-systems.yml` checks them on GitHub Actions with `benchmarks/race/systems.py`. Measured on `ubuntu-latest` (4 cores), [run 44949005331](https://github.com/gimbalzero/certus/actions/runs/44949005331), 21 Nov 2026: best of 3 runs (1 run for HOL Light).
+
+These are **not** certificate checks like the Lean rows above. Each system checks its own file its own way, and the proofs differ: Rocq uses `nia`, Isabelle `auto`, HOL Light `ARITH_TAC`, and Agda has no tactics, so its proof is an explicit term with its own arithmetic lemmas and no standard library.
+
+| System | What is timed | 1 theorem | 1,000 theorems | Stored proof (1 / 1,000) |
+|---|---|---|---|---|
+| Rocq 9.3.0 | `rocq compile`: elaborate, run tactics, kernel-check, write `.vo` | 284 ms | 4,419 ms | `.vo`: 4.2 KB / 1,028 KB |
+| Rocq 9.3.0 | `rocqchk -norec`: re-check the stored `.vo`, trust imports | 284 ms | 1,459 ms | (same `.vo`) |
+| Rocq 9.3.0 | `rocqchk`: re-check the `.vo` and every library it loads (Stdlib's `Lia` and its dependencies) | 14,291 ms | 15,575 ms | (same `.vo`) |
+| Agda 2.9.0 | `agda`: type-check from source, write `.agdai` | 111 ms | 10,369 ms | `.agdai`: 29 KB / 2,052 KB |
+| Isabelle2026 | `isabelle build`: a session on top of the shipped HOL heap (wall includes JVM and ML start-up; CPU is summed over threads) | 10,403 ms (Isabelle reports 4 s elapsed) | 25,802 ms (Isabelle reports 19 s elapsed) | session heap: 4.0 MB / 38.7 MB |
+| HOL Light (1a0c0e6, OCaml 4.14.5) | the proof script, run in a session that already loaded the core (CPU time, `Sys.time`) | 38 ms | 34,289 ms | none: an LCF kernel keeps theorems, not proofs (the script is 0.3 KB / 227 KB) |
+
+Loading the HOL Light core before the script took most of that session's 128 s of wall time (that 128 s also includes the 34 s for 1,000 theorems). Isabelle stores no proof objects by default, so its row reports the session heap that the build saves.
+
 ## Not in the race (yet)
 
 - **The automated (`simp`/`omega`) proof.** It depends on `Lean.Syntax`, a *nested* inductive type. Certus now checks it (1,341 declarations, 4.2 MB certificate, about 190 ms; nanoda and con-leche accept the same certificate), but it has not been raced yet.
 - **Lean4Lean.** The binary we have was built for a different Lean version.
-- **Rocq, Isabelle, Agda, HOL Light.** Each needs several GB to install, which this machine doesn't have free. They are planned for CI.
 - **Metamath on just this theorem.** set.mm's `arisum` depends on 4,594 earlier theorems. Verifying them one command at a time took 44 s, almost all of it command overhead, so the number would mislead. The whole-library time above is the fair Metamath figure.
 
 ## Reproduce
@@ -46,5 +62,11 @@ Each copy has its own recursive definition, so this is 1,000 definitions and 1,0
 ```bash
 cargo build --release                         # at the repo root
 export PATH=/path/to/lean-4.36.0/bin:$PATH    # lean, leanexport, leanchecker, nanoda_bin, con-leche
-python3 benchmarks/race/race.py --runs 7
+python3 benchmarks/race/race.py --runs 7       # --json out.json for raw numbers
 ```
+
+Missing optional checkers (leanchecker, nanoda, con-leche, Metamath) are skipped with a note; `--require all` makes them mandatory. The script also feeds Certus seven tampered certificates and fails unless it rejects every one.
+
+## In CI
+
+`.github/workflows/race.yml` runs the race on every push to `main` (and on demand) on a GitHub Linux runner: Lean 4.36.0 via elan, lean4export, nanoda and con-leche built from pinned sources, Metamath and set.mm fetched as in `proof-bench/bench.sh`. The JSON and the tables are uploaded as the `race-results` artifact and shown in the run summary. The job fails if any checker rejects a valid certificate, if Certus accepts a tampered one, or if a checker is missing.
