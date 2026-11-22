@@ -24,7 +24,7 @@ v0 reads the output of [`lean4export`](https://github.com/leanprover/lean4export
 | expression | `ie` | `bvar`, `sort`, `const`, `app`, `lam`, `forallE`, `letE`, `proj`, `natVal`, `strVal` |
 | declaration | none | `axiom`, `def`, `thm`, `opaque`, `quot`, `inductive` |
 
-Name id 0 is the anonymous name and level id 0 is zero; neither is written. Expression ids start at 0. Ids are dense and increasing, and a record may refer only to ids defined before it.
+Name id 0 is the anonymous name and level id 0 is zero; neither is written. Expression ids start at 0. Writers emit ids dense and increasing. Readers accept any ids that are distinct within each kind (names, levels, expressions), as Lean's own importer does, but a record may refer only to ids defined before it, so the records form an acyclic graph. Hashes depend only on content, never on ids.
 
 A conforming reader **must reject**:
 - unknown record kinds or fields;
