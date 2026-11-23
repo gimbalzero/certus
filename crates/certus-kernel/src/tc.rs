@@ -878,7 +878,44 @@ impl<'a> TC<'a> {
         Ok(self.st.app(smk, list))
     }
 
+    /// The value of `e` as a literal, for native arithmetic. A closed `e` is
+    /// reduced fully. An open one (it mentions a local variable) only by head
+    /// steps and by unfolding definitions at its head, and a `Nat` operation
+    /// at its head is only computed natively, never unfolded: fully reducing
+    /// `x + 2^31` would unfold `Nat.add` 2^31 times, while `const42 x` is
+    /// just `42`. Anything else is not a literal (`None`), so the caller
+    /// falls back to ordinary reduction, exactly as without native arithmetic.
     fn nat_lit_value(&mut self, e: E) -> R<Option<BigUint>> {
+        let mut t = e;
+        loop {
+            if !self.st.info(t).has_fvar {
+                return self.closed_nat_lit_value(t);
+            }
+            self.burn()?;
+            let t1 = self.whnf_core(t)?;
+            if !self.st.info(t1).has_fvar {
+                return self.closed_nat_lit_value(t1);
+            }
+            if let Node::Const(n, _) = self.st.node(self.st.head(t1)) {
+                let b = &self.env.builtins;
+                if Some(n) == b.nat_succ || b.nat_ops.iter().any(|(m, _)| *m == n) {
+                    return Ok(match self.reduce_nat(t1)? {
+                        Some(v) => match self.st.node(v) {
+                            Node::Nat(i) => Some(self.st.nat_val(i).clone()),
+                            _ => None,
+                        },
+                        None => None,
+                    });
+                }
+            }
+            match self.unfold(t1) {
+                Some(u) => t = u,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn closed_nat_lit_value(&mut self, e: E) -> R<Option<BigUint>> {
         let w = self.whnf(e)?;
         Ok(match self.st.node(w) {
             Node::Nat(i) => Some(self.st.nat_val(i).clone()),
@@ -887,11 +924,10 @@ impl<'a> TC<'a> {
         })
     }
 
-    /// Accelerated `Nat` arithmetic on literals.
+    /// Accelerated `Nat` arithmetic on literals. The arguments may be open
+    /// terms (`const42 x`), as long as they reduce to literals: only those
+    /// values are computed with.
     fn reduce_nat(&mut self, e: E) -> R<Option<E>> {
-        if self.st.info(e).has_fvar {
-            return Ok(None);
-        }
         let (f, args) = self.st.spine(e);
         let Node::Const(n, _) = self.st.node(f) else { return Ok(None) };
         if args.len() == 1 && Some(n) == self.env.builtins.nat_succ {
@@ -943,6 +979,9 @@ impl<'a> TC<'a> {
             NatOp::Land => a & b,
             NatOp::Lor => a | b,
             NatOp::Xor => a ^ b,
+            // `0 <<< n` is 0 for every `n`; otherwise a huge shift would need a
+            // huge number, so it is left to unfolding.
+            NatOp::ShiftLeft if a.is_zero() => BigUint::zero(),
             NatOp::ShiftLeft => match small(&b) {
                 Some(s) => a << s,
                 None => return Ok(None),
@@ -951,6 +990,15 @@ impl<'a> TC<'a> {
                 Some(s) => a >> s,
                 None => BigUint::zero(),
             },
+            // `0 ^ n` and `1 ^ n` are small for every `n`.
+            NatOp::Pow if a.is_zero() => {
+                if b.is_zero() {
+                    BigUint::one()
+                } else {
+                    BigUint::zero()
+                }
+            }
+            NatOp::Pow if a.is_one() => BigUint::one(),
             NatOp::Pow => match small(&b) {
                 Some(s) => num_traits::pow(a, s as usize),
                 None => return Ok(None),
@@ -964,7 +1012,6 @@ impl<'a> TC<'a> {
             }
             NatOp::Log2 => unreachable!(),
         };
-        let _ = BigUint::one();
         Ok(Some(self.st.nat(r)))
     }
 
