@@ -587,10 +587,94 @@ struct Builder {
     exprs: Vec<Expr>,
     decls: Vec<Decl>,
     decl_of_name: HashMap<NameId, usize>,
+    /// Expressions and declarations so far (stored in `exprs` and `decls`,
+    /// or, when streaming, handed out in `out` instead).
+    n_exprs: usize,
+    n_decls: usize,
+    out: Option<Vec<Item>>,
+}
+
+/// What [`stream`] calls with each batch of records.
+pub type OnBatch<'a> = dyn FnMut(&Streamed, Vec<Item>) -> Result<(), String> + 'a;
+
+/// A record handed out by [`stream`], in file order, with internal ids.
+#[derive(Debug)]
+pub enum Item {
+    Expr(ExprId, Expr),
+    Decl(Decl),
+}
+
+/// What [`stream`] keeps while it reads: everything but the expressions and
+/// declarations, which it hands out instead.
+pub struct Streamed<'a> {
+    pub names: &'a [Name],
+    pub name_canon: &'a [NameId],
+    pub levels: &'a [Level],
+    /// Canonical name id -> position of the declaration defining it.
+    pub decl_of_name: &'a HashMap<NameId, usize>,
+    /// Expressions and declarations read so far.
+    pub exprs: usize,
+    pub decls: usize,
+}
+
+/// The end of a [`stream`].
+pub struct StreamEnd {
+    pub meta: Meta,
+    pub names: Vec<Name>,
+    pub name_canon: Vec<NameId>,
+    pub levels: Vec<Level>,
+    pub decl_of_name: HashMap<NameId, usize>,
+    pub exprs: usize,
+    pub decls: usize,
+    pub bytes: u64,
+    pub lines: u64,
+}
+
+/// Read an export without keeping its expressions and declarations: they are
+/// validated and linked exactly as [`parse`] does, then handed to `f` in
+/// file order, a batch at a time, together with what has been read so far.
+/// For exports too large to hold in memory. An error from `f` stops the
+/// stream and is returned as the error of the line being read.
+pub fn stream<R: BufRead + Send>(reader: R, jobs: usize, f: &mut OnBatch) -> Result<StreamEnd, ParseError> {
+    let mut b = Builder::new(true);
+    let (lines, bytes) = run(reader, jobs, BATCH_PER_THREAD, &mut b, f)?;
+    let meta = b.meta.ok_or(ParseError { line: 0, msg: "empty export: no meta record".into() })?;
+    Ok(StreamEnd {
+        meta,
+        names: b.names,
+        name_canon: b.name_canon,
+        levels: b.levels,
+        decl_of_name: b.decl_of_name,
+        exprs: b.n_exprs,
+        decls: b.n_decls,
+        bytes,
+        lines,
+    })
+}
+
+impl Builder {
+    fn new(streaming: bool) -> Self {
+        Builder {
+            meta: None,
+            name_ids: IdMap::default(),
+            level_ids: IdMap::default(),
+            expr_ids: IdMap::default(),
+            names: vec![Name::Anon],
+            name_canon: vec![0],
+            name_index: HashMap::new(),
+            levels: vec![Level::Zero],
+            exprs: Vec::new(),
+            decls: Vec::new(),
+            decl_of_name: HashMap::new(),
+            n_exprs: 0,
+            n_decls: 0,
+            out: streaming.then(Vec::new),
+        }
+    }
 }
 
 /// Parse a whole export. Fails on the first malformed record.
-pub fn parse<R: BufRead>(reader: R) -> Result<Env, ParseError> {
+pub fn parse<R: BufRead + Send>(reader: R) -> Result<Env, ParseError> {
     parse_jobs(reader, std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
@@ -607,75 +691,16 @@ type Decoded = (u64, Result<Rec, String>);
 /// parallel, a batch at a time, then added to the environment in file order
 /// by one thread, so the result, and the first error reported, are the same
 /// for every `jobs`.
-pub fn parse_jobs<R: BufRead>(reader: R, jobs: usize) -> Result<Env, ParseError> {
+pub fn parse_jobs<R: BufRead + Send>(reader: R, jobs: usize) -> Result<Env, ParseError> {
     parse_batched(reader, jobs, BATCH_PER_THREAD)
 }
 
 /// [`parse_jobs`] with batches of `batch` bytes per thread. Tests use tiny
 /// batches, so that lines cross batch boundaries.
 #[doc(hidden)]
-pub fn parse_batched<R: BufRead>(mut reader: R, jobs: usize, batch: usize) -> Result<Env, ParseError> {
-    let jobs = jobs.max(1);
-    let batch = batch.max(1);
-    let mut b = Builder {
-        meta: None,
-        name_ids: IdMap::default(),
-        level_ids: IdMap::default(),
-        expr_ids: IdMap::default(),
-        names: vec![Name::Anon],
-        name_canon: vec![0],
-        name_index: HashMap::new(),
-        levels: vec![Level::Zero],
-        exprs: Vec::new(),
-        decls: Vec::new(),
-        decl_of_name: HashMap::new(),
-    };
-    let (mut lines, mut bytes) = (0u64, 0u64);
-    let mut block: Vec<u8> = Vec::new();
-    let mut eof = false;
-    let mut want = batch * jobs;
-    while !eof {
-        // Fill a block, then hold back any partial last line for the next one.
-        while block.len() < want {
-            let avail =
-                reader.fill_buf().map_err(|e| ParseError { line: lines + 1, msg: format!("read error: {e}") })?;
-            if avail.is_empty() {
-                eof = true;
-                break;
-            }
-            let n = avail.len();
-            block.extend_from_slice(avail);
-            reader.consume(n);
-        }
-        let cut = if eof { block.len() } else { block.iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1) };
-        if cut == 0 && !eof {
-            // A line longer than the whole block: read a bigger block.
-            want *= 2;
-            continue;
-        }
-        want = batch * jobs;
-        let rest = block.split_off(cut);
-        let pieces = split_lines(&block, jobs);
-        let decoded: Vec<(Vec<Decoded>, u64)> = if pieces.len() <= 1 {
-            pieces.iter().enumerate().map(|(k, p)| decode(p, lines == 0 && k == 0)).collect()
-        } else {
-            std::thread::scope(|s| {
-                let hs: Vec<_> =
-                    pieces.iter().enumerate().map(|(k, p)| s.spawn(move || decode(p, lines == 0 && k == 0))).collect();
-                hs.into_iter().map(|h| h.join().expect("decoder thread panicked")).collect()
-            })
-        };
-        for (records, n) in decoded {
-            for (rel, rec) in records {
-                let line = lines + rel;
-                let rec = rec.map_err(|msg| ParseError { line, msg })?;
-                b.add(rec).map_err(|msg| ParseError { line, msg })?;
-            }
-            lines += n;
-        }
-        bytes += block.len() as u64;
-        block = rest;
-    }
+pub fn parse_batched<R: BufRead + Send>(reader: R, jobs: usize, batch: usize) -> Result<Env, ParseError> {
+    let mut b = Builder::new(false);
+    let (lines, bytes) = run(reader, jobs, batch, &mut b, &mut |_, _| Ok(()))?;
     let meta = b.meta.ok_or(ParseError { line: 0, msg: "empty export: no meta record".into() })?;
     Ok(Env {
         meta,
@@ -688,6 +713,196 @@ pub fn parse_batched<R: BufRead>(mut reader: R, jobs: usize, batch: usize) -> Re
         bytes,
         lines,
     })
+}
+
+/// Decode `reader` in batches of `batch` bytes per thread on `jobs` threads,
+/// adding every record to `b` in file order; when streaming, hand each
+/// batch's expressions and declarations to `f`. Returns the line and byte counts.
+///
+/// Three things overlap: one thread reads (and decompresses) blocks of whole
+/// lines, `jobs` threads decode the next block's lines, and this thread adds
+/// the current block's records in order. The result is the same as decoding
+/// and adding one line at a time.
+fn run<R: BufRead + Send>(
+    reader: R,
+    jobs: usize,
+    batch: usize,
+    b: &mut Builder,
+    f: &mut OnBatch,
+) -> Result<(u64, u64), ParseError> {
+    use std::sync::mpsc::{channel, sync_channel};
+    use std::sync::{Arc, Mutex};
+    let jobs = jobs.max(1);
+    let batch = batch.max(1);
+    std::thread::scope(|s| {
+        let (btx, brx) = sync_channel::<Result<Vec<u8>, String>>(4);
+        s.spawn(move || read_blocks(reader, batch * jobs, btx));
+        let (jtx, jrx) = channel::<Job>();
+        let jrx = Arc::new(Mutex::new(jrx));
+        let (rtx, rrx) = channel::<(u64, usize, (Vec<Decoded>, u64))>();
+        for _ in 0..jobs {
+            let (jrx, rtx) = (jrx.clone(), rtx.clone());
+            s.spawn(move || {
+                loop {
+                    let job = match jrx.lock() {
+                        Ok(rx) => rx.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(j) = job else { return };
+                    let r = decode(&j.block[j.start..j.end], j.file_start);
+                    if rtx.send((j.seq, j.idx, r)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(rtx);
+        let result = (|| {
+            let (mut lines, mut bytes) = (0u64, 0u64);
+            let mut done: FxMap<(u64, usize), (Vec<Decoded>, u64)> = FxMap::default();
+            // Submit a block's pieces to the decoders; returns how many there are.
+            let submit = |block: Arc<Vec<u8>>, seq: u64| -> usize {
+                let ranges = split_ranges(&block, jobs);
+                for (idx, &(start, end)) in ranges.iter().enumerate() {
+                    let job = Job { seq, idx, block: block.clone(), start, end, file_start: seq == 0 && idx == 0 };
+                    if jtx.send(job).is_err() {
+                        break;
+                    }
+                }
+                ranges.len()
+            };
+            let next_block = |lines: u64| -> Result<Option<Arc<Vec<u8>>>, ParseError> {
+                match brx.recv() {
+                    Ok(Ok(block)) => Ok(Some(Arc::new(block))),
+                    Ok(Err(msg)) => Err(ParseError { line: lines + 1, msg }),
+                    Err(_) => Ok(None),
+                }
+            };
+            let mut seq = 0u64;
+            let mut cur = next_block(0)?.map(|blk| (blk.clone(), submit(blk, 0)));
+            while let Some((block, pieces)) = cur.take() {
+                // Decode the next block while this one is added.
+                let next = next_block(lines)?.map(|blk| (blk.clone(), submit(blk, seq + 1)));
+                for idx in 0..pieces {
+                    let (records, n) = loop {
+                        if let Some(r) = done.remove(&(seq, idx)) {
+                            break r;
+                        }
+                        match rrx.recv() {
+                            Ok((s2, i2, r)) => {
+                                done.insert((s2, i2), r);
+                            }
+                            Err(_) => {
+                                return Err(ParseError { line: lines + 1, msg: "decoder threads stopped".into() });
+                            }
+                        }
+                    };
+                    for (rel, rec) in records {
+                        let line = lines + rel;
+                        let rec = rec.map_err(|msg| ParseError { line, msg })?;
+                        b.add(rec).map_err(|msg| ParseError { line, msg })?;
+                    }
+                    lines += n;
+                }
+                if let Some(out) = b.out.as_mut().filter(|o| !o.is_empty()) {
+                    let items = std::mem::take(out);
+                    let seen = Streamed {
+                        names: &b.names,
+                        name_canon: &b.name_canon,
+                        levels: &b.levels,
+                        decl_of_name: &b.decl_of_name,
+                        exprs: b.n_exprs,
+                        decls: b.n_decls,
+                    };
+                    f(&seen, items).map_err(|msg| ParseError { line: lines, msg })?;
+                }
+                bytes += block.len() as u64;
+                seq += 1;
+                cur = next;
+            }
+            Ok((lines, bytes))
+        })();
+        // Stop the reader and the decoders (also after an error).
+        drop(brx);
+        drop(jtx);
+        result
+    })
+}
+
+type FxMap<K, V> = HashMap<K, V>;
+
+/// A piece of a block for a decoder thread.
+struct Job {
+    seq: u64,
+    idx: usize,
+    block: std::sync::Arc<Vec<u8>>,
+    start: usize,
+    end: usize,
+    file_start: bool,
+}
+
+/// Read blocks of whole lines (about `want` bytes each; bigger when a line is
+/// longer) and send them in order; a read error is sent as the last item.
+fn read_blocks<R: BufRead>(mut reader: R, want0: usize, tx: std::sync::mpsc::SyncSender<Result<Vec<u8>, String>>) {
+    let mut block: Vec<u8> = Vec::with_capacity(want0);
+    let mut want = want0;
+    loop {
+        let mut eof = false;
+        while block.len() < want {
+            match reader.fill_buf() {
+                Ok([]) => {
+                    eof = true;
+                    break;
+                }
+                Ok(avail) => {
+                    let n = avail.len();
+                    block.extend_from_slice(avail);
+                    reader.consume(n);
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("read error: {e}")));
+                    return;
+                }
+            }
+        }
+        let cut = if eof { block.len() } else { block.iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1) };
+        if cut == 0 && !eof {
+            // A line longer than the whole block: read a bigger block.
+            want *= 2;
+            continue;
+        }
+        want = want0;
+        let rest = block.split_off(cut);
+        if !block.is_empty() && tx.send(Ok(block)).is_err() {
+            return;
+        }
+        if eof {
+            return;
+        }
+        block = rest;
+        block.reserve(want0);
+    }
+}
+
+/// Split `block` into at most `n` ranges of whole lines.
+fn split_ranges(block: &[u8], n: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(n);
+    let mut start = 0;
+    for k in 1..n {
+        let target = (block.len() * k / n).max(start);
+        let end = match block[target..].iter().position(|&c| c == b'\n') {
+            Some(i) => target + i + 1,
+            None => break,
+        };
+        if end > start {
+            out.push((start, end));
+            start = end;
+        }
+    }
+    if start < block.len() {
+        out.push((start, block.len()));
+    }
+    out
 }
 
 /// A strict fast path for the commonest record shapes, exactly as lean4export
@@ -877,27 +1092,6 @@ pub fn set_fast_path_for_tests(on: bool) {
     FAST.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Split `block` into at most `n` pieces of whole lines.
-fn split_lines(block: &[u8], n: usize) -> Vec<&[u8]> {
-    let mut out = Vec::with_capacity(n);
-    let mut start = 0;
-    for k in 1..n {
-        let target = (block.len() * k / n).max(start);
-        let end = match block[target..].iter().position(|&c| c == b'\n') {
-            Some(i) => target + i + 1,
-            None => break,
-        };
-        if end > start {
-            out.push(&block[start..end]);
-            start = end;
-        }
-    }
-    if start < block.len() {
-        out.push(&block[start..]);
-    }
-    out
-}
-
 /// Decode and classify the lines of `piece`, numbered from 1, stopping at the
 /// first one that is not a valid record. `file_start`: the piece starts the
 /// file, so its line 1 must be the meta record. Also returns how many lines
@@ -948,7 +1142,7 @@ impl Builder {
     }
 
     fn expr(&self, id: ExprId) -> Result<ExprId, String> {
-        self.expr_ids.get(id, self.exprs.len()).ok_or_else(|| format!("reference to undefined expression {id}"))
+        self.expr_ids.get(id, self.n_exprs).ok_or_else(|| format!("reference to undefined expression {id}"))
     }
 
     /// Add one classified record. Only this needs the records before it.
@@ -1018,8 +1212,12 @@ impl Builder {
                     }
                     lit @ (Expr::NatLit(_) | Expr::StrLit(_)) => lit,
                 };
-                self.expr_ids.define("expression", id, self.exprs.len())?;
-                self.exprs.push(e);
+                let internal = self.expr_ids.define("expression", id, self.n_exprs)?;
+                self.n_exprs += 1;
+                match &mut self.out {
+                    Some(out) => out.push(Item::Expr(internal, e)),
+                    None => self.exprs.push(e),
+                }
                 Ok(())
             }
             Rec::Decl(d) => {
@@ -1030,15 +1228,19 @@ impl Builder {
                 }
                 if self.expr_ids.sparse.is_some() {
                     // Every root resolves (checked just above).
-                    d.map_exprs(&mut |e| self.expr_ids.get(e, self.exprs.len()).expect("checked above"));
+                    d.map_exprs(&mut |e| self.expr_ids.get(e, self.n_exprs).expect("checked above"));
                 }
-                let idx = self.decls.len();
+                let idx = self.n_decls;
                 for n in d.defined_names() {
                     if self.decl_of_name.insert(n, idx).is_some() {
                         return Err(format!("constant defined twice (name id {n})"));
                     }
                 }
-                self.decls.push(d);
+                self.n_decls += 1;
+                match &mut self.out {
+                    Some(out) => out.push(Item::Decl(d)),
+                    None => self.decls.push(d),
+                }
                 Ok(())
             }
         }

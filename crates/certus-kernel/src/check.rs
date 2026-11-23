@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CheckError {
     pub decl: String,
     pub msg: String,
@@ -26,7 +26,7 @@ pub struct CheckError {
 }
 
 impl CheckError {
-    fn new(decl: String, e: KError) -> Self {
+    pub(crate) fn new(decl: String, e: KError) -> Self {
         CheckError { decl, resource: e.is_resource(), msg: e.msg().to_string() }
     }
 }
@@ -67,6 +67,18 @@ struct Conv<'x> {
 /// `Store::mk`), so adding one cannot overflow.
 fn memo(e: E) -> Option<NonZeroU32> {
     NonZeroU32::new(e.0 + 1)
+}
+
+/// Where the type checker's terms for export expressions come from: a whole
+/// parsed export (`Conv`), or a stream (`crate::stream`).
+pub(crate) trait ExprSource {
+    fn expr(&mut self, st: &mut Store, id: u32) -> R<E>;
+}
+
+impl ExprSource for Conv<'_> {
+    fn expr(&mut self, st: &mut Store, id: u32) -> R<E> {
+        Conv::expr(self, st, id)
+    }
 }
 
 impl Conv<'_> {
@@ -195,13 +207,16 @@ pub fn check_with(env: &Env, decls: &[usize], jobs: usize, known_good: &[bool]) 
     })?;
     let todo = pre.todo.iter().filter(|t| t.is_some()).count();
     let jobs = if todo == 0 { 0 } else { jobs.clamp(1, todo) };
+    let name_of = |n: NameId| prep.strs[n as usize].clone();
     let shared = Shared {
-        strs: &prep.strs,
+        name: &name_of,
+        offset: 0,
         todo: std::mem::take(&mut pre.todo),
         consts: std::mem::take(&mut pre.consts),
         builtins: std::mem::take(&mut pre.builtins),
         next: AtomicUsize::new(0),
         first_failure: AtomicUsize::new(pre.failure.as_ref().map_or(usize::MAX, |(p, _)| *p)),
+        running: Default::default(),
     };
     let skip = pre.term_nodes;
     let store = std::mem::take(&mut pre.store);
@@ -257,7 +272,7 @@ pub fn check_with(env: &Env, decls: &[usize], jobs: usize, known_good: &[bool]) 
 }
 
 /// Run `f` on a new thread with the checker's stack (`STACK_SIZE`).
-fn spawn_checker<'s, 'e, T: Send + 's>(
+pub(crate) fn spawn_checker<'s, 'e, T: Send + 's>(
     s: &'s std::thread::Scope<'s, 'e>,
     name: String,
     f: impl FnOnce() -> T + Send + 's,
@@ -317,14 +332,14 @@ impl Prep {
 
 /// What the type checker still has to check for one declaration: that `ty`
 /// is a type (a proposition, if `thm`) and that `val`, if any, has type `ty`.
-struct Todo {
+pub(crate) struct Todo {
     /// Index of the declaration in `env.decls`, and its name.
-    decl: usize,
-    decl_name: NameId,
-    lparams: Vec<NameId>,
-    ty: E,
-    val: Option<E>,
-    thm: bool,
+    pub(crate) decl: usize,
+    pub(crate) decl_name: NameId,
+    pub(crate) lparams: Vec<NameId>,
+    pub(crate) ty: E,
+    pub(crate) val: Option<E>,
+    pub(crate) thm: bool,
 }
 
 /// The result of phase 1 (see `check_jobs`).
@@ -381,7 +396,7 @@ fn prepare(env: &Env, decls: &[usize], prep: &Prep, known: &dyn Fn(usize) -> boo
         kenv.visible = pos;
         let t0 = Instant::now();
         let name = || strs[d.primary_name() as usize].clone();
-        let (new, t) = match admit_decl(&mut st, &kenv, &mut conv, env, d) {
+        let (new, t) = match admit_decl(&mut st, &kenv, &mut conv, &env.names, d) {
             Ok(x) => x,
             Err(e) => {
                 failure = Some((pos, CheckError::new(name(), e)));
@@ -407,7 +422,7 @@ fn prepare(env: &Env, decls: &[usize], prep: &Prep, known: &dyn Fn(usize) -> boo
         }
         kenv.visible = pos + 1;
         for n in added {
-            activate_nat(&mut st, &mut kenv, candidates, n, strs, env, &mut hashes);
+            activate_nat(&mut st, &mut kenv, candidates, n, &|n| strs[n as usize].clone(), env, &mut hashes);
             activate_string(&mut st, &mut kenv, candidates, n);
         }
         if history.last().is_some_and(|(_, b)| *b != kenv.builtins) {
@@ -432,30 +447,35 @@ fn prepare(env: &Env, decls: &[usize], prep: &Prep, known: &dyn Fn(usize) -> boo
 }
 
 /// State shared by the threads of phase 2.
-struct Shared<'a> {
-    strs: &'a [String],
-    todo: Vec<Option<Todo>>,
-    consts: Arc<ConstTable>,
-    builtins: Vec<(usize, Builtins)>,
+pub(crate) struct Shared<'a> {
+    /// The printed name of a constant (for error messages).
+    pub(crate) name: &'a (dyn Fn(NameId) -> String + Sync),
+    /// `todo[i]` is the declaration at position `offset + i`.
+    pub(crate) offset: usize,
+    pub(crate) todo: Vec<Option<Todo>>,
+    pub(crate) consts: Arc<ConstTable>,
+    pub(crate) builtins: Vec<(usize, Builtins)>,
     /// The next position to take.
-    next: AtomicUsize,
+    pub(crate) next: AtomicUsize,
     /// Earliest position known to fail (`usize::MAX`: none yet).
-    first_failure: AtomicUsize,
+    pub(crate) first_failure: AtomicUsize,
+    /// What each worker is checking, and since when (for progress reports).
+    pub(crate) running: std::sync::Mutex<FxHashMap<usize, (usize, Instant)>>,
 }
 
 /// What one thread of phase 2 found.
-struct Worker {
+pub(crate) struct Worker {
     /// Position in `decls` and error of the first failure this worker met.
-    failure: Option<(usize, CheckError)>,
+    pub(crate) failure: Option<(usize, CheckError)>,
     /// Time spent on each declaration this worker type-checked.
-    times: Vec<(usize, Duration)>,
+    pub(crate) times: Vec<(usize, Duration)>,
     /// Terms created by this worker.
-    term_nodes: usize,
+    pub(crate) term_nodes: usize,
 }
 
 /// Phase 2 of `check_jobs`, on store `st`, which holds the `skip` terms of
 /// phase 1.
-fn run_worker(shared: &Shared, mut st: Store, skip: usize) -> Worker {
+pub(crate) fn run_worker(shared: &Shared, mut st: Store, skip: usize) -> Worker {
     let mut kenv = KEnv { consts: shared.consts.clone(), visible: 0, builtins: Builtins::default() };
     let mut era = usize::MAX;
     let mut times: Vec<(usize, Duration)> = Vec::new();
@@ -465,10 +485,10 @@ fn run_worker(shared: &Shared, mut st: Store, skip: usize) -> Worker {
         // Positions are taken in increasing order, so every position before
         // a failure is taken (and checked) by some worker.
         let pos = shared.next.fetch_add(1, Ordering::Relaxed);
-        if pos >= shared.todo.len() || pos >= shared.first_failure.load(Ordering::Relaxed) {
+        if pos >= shared.offset + shared.todo.len() || pos >= shared.first_failure.load(Ordering::Relaxed) {
             break;
         }
-        let Some(t) = &shared.todo[pos] else { continue };
+        let Some(t) = &shared.todo[pos - shared.offset] else { continue };
         let e = shared.builtins.partition_point(|(p, _)| *p <= pos) - 1;
         if e != era {
             kenv.builtins = shared.builtins[e].1.clone();
@@ -476,15 +496,24 @@ fn run_worker(shared: &Shared, mut st: Store, skip: usize) -> Worker {
         }
         kenv.visible = pos;
         let t0 = Instant::now();
-        let r = check_todo(&mut TC::new(&mut st, &kenv, t.lparams.clone()), t);
+        let me = std::thread::current().id();
+        let key = format!("{me:?}").bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize));
+        if let Ok(mut r) = shared.running.lock() {
+            r.insert(key, (pos, t0));
+        }
+        crate::tc::MISSED_PROOF.with(|m| m.set(None));
+        let r = crate::tc::unless_missed_proof(check_todo(&mut TC::new(&mut st, &kenv, t.lparams.clone()), t));
         if let Err(e) = r {
-            failure = Some((pos, CheckError::new(shared.strs[t.decl_name as usize].clone(), e)));
+            failure = Some((pos, CheckError::new((shared.name)(t.decl_name), e)));
             break;
         }
         // Everything in this worker's own store was made by checks that are
         // over: the shared base holds every converted term.
         peak = peak.max(st.num_nodes());
         forget_check_terms(&mut st, skip);
+        if let Ok(mut r) = shared.running.lock() {
+            r.remove(&key);
+        }
         times.push((t.decl, t0.elapsed()));
     }
     if let Some((pos, _)) = &failure {
@@ -601,12 +630,12 @@ fn closure_fingerprint(env: &Env, hashes: &mut hash::LazyHashes, decl: usize) ->
     Some(hash::hex(h.finalize().as_bytes()))
 }
 
-fn activate_nat<'e>(
+pub(crate) fn activate_nat<'e>(
     st: &mut Store,
     kenv: &mut KEnv,
     cand: &Builtins,
     n: NameId,
-    strs: &[String],
+    name_of: &dyn Fn(NameId) -> String,
     env: &'e Env,
     hashes: &mut Option<hash::LazyHashes<'e>>,
 ) {
@@ -643,7 +672,7 @@ fn activate_nat<'e>(
     let Some(&decl) = env.decl_of_name.get(&n) else { return };
     let hashes = hashes.get_or_insert_with(|| hash::LazyHashes::new(env, hash::Mode::AlphaNormal));
     let Some(fp) = closure_fingerprint(env, hashes, decl) else { return };
-    let name = &strs[n as usize];
+    let name = &name_of(n);
     if std::env::var_os("CERTUS_PRINT_FINGERPRINTS").is_some() {
         eprintln!("(\"{name}\", \"{fp}\"),");
     }
@@ -668,7 +697,7 @@ fn activate_nat<'e>(
 ///   `String.mk : List Char → String`, the constructor of `String`.
 ///
 /// Until then, string literals are rejected.
-fn activate_string(st: &mut Store, kenv: &mut KEnv, cand: &Builtins, n: NameId) {
+pub(crate) fn activate_string(st: &mut Store, kenv: &mut KEnv, cand: &Builtins, n: NameId) {
     let names = [cand.string, cand.string_mk, cand.char, cand.char_of_nat, cand.list_nil, cand.list_cons];
     if kenv.builtins.string.is_some() || !names.contains(&Some(n)) {
         return;
@@ -818,7 +847,7 @@ fn check_value(tc: &mut TC, val: E, ty: E) -> R<()> {
 }
 
 /// The type checker's part of checking a definition, theorem, opaque or axiom.
-fn check_todo(tc: &mut TC, t: &Todo) -> R<()> {
+pub(crate) fn check_todo(tc: &mut TC, t: &Todo) -> R<()> {
     let l = check_type(tc, t.ty)?;
     if t.thm && !tc.st.is_zero(l) {
         return Err("theorem type is not a proposition".into());
@@ -830,13 +859,19 @@ fn check_todo(tc: &mut TC, t: &Todo) -> R<()> {
 }
 
 /// The constants a declaration adds, and what is left for the type checker.
-type Admitted = (Vec<(NameId, ConstInfo)>, Option<Todo>);
+pub(crate) type Admitted = (Vec<(NameId, ConstInfo)>, Option<Todo>);
 
 /// Phase 1 of checking one declaration (see `check_jobs`): convert its terms
 /// and run every check that does not need the type checker; check inductive
 /// types and quotients in full. Returns the constants it adds and, for a
 /// definition, theorem, opaque or axiom, what is left for the type checker.
-fn admit_decl(st: &mut Store, kenv: &KEnv, conv: &mut Conv, env: &Env, d: &Decl) -> R<Admitted> {
+pub(crate) fn admit_decl(
+    st: &mut Store,
+    kenv: &KEnv,
+    conv: &mut dyn ExprSource,
+    names: &[ex::Name],
+    d: &Decl,
+) -> R<Admitted> {
     for n in d.defined_names() {
         if kenv.contains(n) {
             return Err("constant declared twice".into());
@@ -960,7 +995,7 @@ fn admit_decl(st: &mut Store, kenv: &KEnv, conv: &mut Conv, env: &Env, d: &Decl)
                 });
             }
             let mut tc = TC::new(st, kenv, Vec::new());
-            (inductive::check_block(&mut tc, &env.names, &blk)?, None)
+            (inductive::check_block(&mut tc, names, &blk)?, None)
         }
     };
     Ok((new, t))
