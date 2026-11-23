@@ -214,6 +214,13 @@ struct Checker<'s> {
     times: Vec<(String, Duration)>,
     progress: bool,
     started: Instant,
+    /// Proofs of theorems admitted before this position are kept (the
+    /// prelude zone: `Nat` fingerprints cover their closures).
+    zone_end: usize,
+    /// `CERTUS_EXTRACT=name:path`: write that declaration's dependency
+    /// closure as a standalone export, and stop.
+    extract: Option<(String, String)>,
+    decls_meta: Vec<Decl>,
 }
 
 /// Looks up the term of an export expression for `admit_decl`.
@@ -306,6 +313,9 @@ impl<'s> Checker<'s> {
                 return Err(());
             }
         };
+        if self.extract.is_some() {
+            self.decls_meta.push(d.clone());
+        }
         if let Some(z) = &mut self.zone {
             z.decls.push(d.clone());
             for n in d.defined_names() {
@@ -324,6 +334,16 @@ impl<'s> Checker<'s> {
             self.batch_names.push(n);
         }
         self.todo.push(todo.map(|t| Todo { decl: pos, ..t }));
+        if let Some((target, path)) = self.extract.clone()
+            && name_string(seen.names, d.primary_name()) == target
+        {
+            let msg = match self.write_closure(seen, d.primary_name(), &path) {
+                Ok(n) => format!("extracted {target} and the {n} declarations it depends on to {path}"),
+                Err(e) => format!("could not write {path}: {e}"),
+            };
+            self.failure = Some((pos, err(&target, msg, true)));
+            return Err(());
+        }
         *self.kinds.entry(d.kind()).or_default() += 1;
         self.pos = pos + 1;
         // Builtins switch on once the constants they need are present.
@@ -344,10 +364,12 @@ impl<'s> Checker<'s> {
             self.builtins = kenv.builtins.clone();
             self.history.push((pos + 1, self.builtins.clone()));
         }
-        if self.zone.as_ref().is_some_and(|z| z.exprs.len() > ZONE_MAX_EXPRS)
-            || (!cand.nat_ops.is_empty() && self.builtins.nat_ops.len() == cand.nat_ops.len())
+        if self.zone.is_some()
+            && (self.zone.as_ref().is_some_and(|z| z.exprs.len() > ZONE_MAX_EXPRS)
+                || (!cand.nat_ops.is_empty() && self.builtins.nat_ops.len() == cand.nat_ops.len()))
         {
             self.zone = None;
+            self.zone_end = pos + 1;
         }
         Ok(())
     }
@@ -465,7 +487,7 @@ impl<'s> Checker<'s> {
             roots.push(c.ty);
             match &c.kind {
                 Kind::Def { val, .. } => roots.push(*val),
-                Kind::Thm { val } if concludes(&self.st, &self.keep_proofs_of, c.ty) => {
+                Kind::Thm { val } if table[n].0 < self.zone_end || concludes(&self.st, &self.keep_proofs_of, c.ty) => {
                     roots.push(*val);
                     keep_proof.push(*n);
                 }
@@ -502,6 +524,275 @@ impl<'s> Checker<'s> {
         self.batch_first += self.batch_map.len() as u32;
         self.batch_map.clear();
         self.persist = self.st.num_nodes();
+    }
+}
+
+impl Checker<'_> {
+    /// Write the dependency closure of constant `target` (just admitted) as a
+    /// standalone export: names and declaration metadata as in the original,
+    /// expressions re-emitted from the kernel's terms (binder names and
+    /// binder info are lost; the kernel ignores them). A theorem whose proof
+    /// was not kept becomes an axiom, and an opaque one too (the kernel does
+    /// not keep opaque values). Returns how many declarations were written.
+    fn write_closure(&self, seen: &Streamed, target: NameId, path: &str) -> std::io::Result<usize> {
+        use std::io::Write;
+        let table = &self.consts;
+        let st = &self.st;
+        let mut todo: Vec<NameId> = vec![target];
+        let c = &self.cand;
+        todo.extend(
+            [
+                c.nat,
+                c.nat_zero,
+                c.nat_succ,
+                c.bool_true,
+                c.bool_false,
+                c.string,
+                c.string_mk,
+                c.string_of_list,
+                c.char,
+                c.char_of_nat,
+                c.list_nil,
+                c.list_cons,
+                c.eq,
+                c.eq_refl,
+                c.quot,
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        todo.extend(c.nat_ops.iter().map(|(n, _)| *n));
+        let mut seen_names: rustc_hash::FxHashSet<NameId> = Default::default();
+        let mut positions: std::collections::BTreeSet<usize> = Default::default();
+        let mut seen_e: rustc_hash::FxHashSet<E> = Default::default();
+        let mut stack: Vec<E> = Vec::new();
+        while let Some(n) = todo.pop() {
+            if !seen_names.insert(n) {
+                continue;
+            }
+            let Some((pos, info)) = table.get(&n) else { continue };
+            if positions.insert(*pos) {
+                todo.extend(self.decls_meta[*pos].defined_names());
+            }
+            stack.push(info.ty);
+            match &info.kind {
+                Kind::Def { val, .. } => stack.push(*val),
+                Kind::Thm { val } if *val != DROPPED => stack.push(*val),
+                Kind::Rec { rules, .. } => stack.extend(rules.iter().map(|r| r.rhs)),
+                _ => {}
+            }
+            while let Some(e) = stack.pop() {
+                if !seen_e.insert(e) {
+                    continue;
+                }
+                match st.node(e) {
+                    Node::Const(m, _) => todo.push(m),
+                    Node::Proj(s, _, x) => {
+                        todo.push(s);
+                        stack.push(x);
+                    }
+                    Node::App(a, b) | Node::Lam(a, b) | Node::Pi(a, b) => stack.extend([a, b]),
+                    Node::Let(a, b, x) => stack.extend([a, b, x]),
+                    _ => {}
+                }
+            }
+        }
+        // Emit expressions children first: kernel ids increase from parts to wholes.
+        let mut es: Vec<E> = seen_e.into_iter().collect();
+        es.sort_unstable();
+        let mut used_names: std::collections::BTreeSet<NameId> = Default::default();
+        let mut lv: FxHashMap<L, usize> = FxHashMap::default();
+        lv.insert(st.zero, 0);
+        let mut level_lines: Vec<String> = Vec::new();
+        fn level(
+            st: &Store,
+            l: L,
+            lv: &mut FxHashMap<L, usize>,
+            out: &mut Vec<String>,
+            names: &mut std::collections::BTreeSet<NameId>,
+        ) -> usize {
+            if let Some(&i) = lv.get(&l) {
+                return i;
+            }
+            let body = match st.lnode(l) {
+                Level::Zero => unreachable!("level zero is id 0"),
+                Level::Succ(a) => format!("\"succ\":{}", level(st, a, lv, out, names)),
+                Level::Max(a, b) => {
+                    format!("\"max\":[{},{}]", level(st, a, lv, out, names), level(st, b, lv, out, names))
+                }
+                Level::IMax(a, b) => {
+                    format!("\"imax\":[{},{}]", level(st, a, lv, out, names), level(st, b, lv, out, names))
+                }
+                Level::Param(p) => {
+                    names.insert(p);
+                    format!("\"param\":{p}")
+                }
+            };
+            let i = lv.len();
+            lv.insert(l, i);
+            out.push(format!("{{\"il\":{i},{body}}}"));
+            i
+        }
+        let mut ids: FxHashMap<E, usize> = FxHashMap::default();
+        let mut expr_lines: Vec<String> = Vec::with_capacity(es.len());
+        for &e in &es {
+            let k = ids.len();
+            let id = |x: E| ids[&x];
+            let line = match st.node(e) {
+                Node::BVar(i) => format!("{{\"bvar\":{i},\"ie\":{k}}}"),
+                Node::FVar(_) => continue,
+                Node::Sort(l) => {
+                    format!("{{\"ie\":{k},\"sort\":{}}}", level(st, l, &mut lv, &mut level_lines, &mut used_names))
+                }
+                Node::Const(n, ls) => {
+                    used_names.insert(n);
+                    let us: Vec<String> = st
+                        .list_of(ls)
+                        .to_vec()
+                        .into_iter()
+                        .map(|l| level(st, l, &mut lv, &mut level_lines, &mut used_names).to_string())
+                        .collect();
+                    format!("{{\"const\":{{\"name\":{n},\"us\":[{}]}},\"ie\":{k}}}", us.join(","))
+                }
+                Node::App(f, a) => format!("{{\"app\":{{\"arg\":{},\"fn\":{}}},\"ie\":{k}}}", id(a), id(f)),
+                Node::Lam(d, b) => format!(
+                    "{{\"ie\":{k},\"lam\":{{\"binderInfo\":\"default\",\"body\":{},\"name\":0,\"type\":{}}}}}",
+                    id(b),
+                    id(d)
+                ),
+                Node::Pi(d, b) => format!(
+                    "{{\"forallE\":{{\"binderInfo\":\"default\",\"body\":{},\"name\":0,\"type\":{}}},\"ie\":{k}}}",
+                    id(b),
+                    id(d)
+                ),
+                Node::Let(t, v, b) => format!(
+                    "{{\"ie\":{k},\"letE\":{{\"body\":{},\"name\":0,\"nondep\":false,\"type\":{},\"value\":{}}}}}",
+                    id(b),
+                    id(t),
+                    id(v)
+                ),
+                Node::Nat(i) => format!("{{\"ie\":{k},\"natVal\":\"{}\"}}", st.nat_val(i)),
+                Node::Str(i) => {
+                    format!("{{\"ie\":{k},\"strVal\":{}}}", serde_json::to_string(st.str_val(i)).unwrap_or_default())
+                }
+                Node::Proj(s, i, x) => {
+                    used_names.insert(s);
+                    format!("{{\"ie\":{k},\"proj\":{{\"idx\":{i},\"struct\":{},\"typeName\":{s}}}}}", id(x))
+                }
+            };
+            ids.insert(e, k);
+            expr_lines.push(line);
+        }
+        // Declarations, with their expressions renumbered.
+        let ty = |n: NameId| table.get(&n).map(|(_, c)| ids[&c.ty]);
+        let mut decl_lines: Vec<String> = Vec::new();
+        for &pos in &positions {
+            let d = &self.decls_meta[pos];
+            for n in d.defined_names() {
+                used_names.insert(n);
+            }
+            let line = match d {
+                Decl::Axiom(a) => {
+                    let mut a = a.clone();
+                    a.r#type = ty(a.name).unwrap_or(0) as u32;
+                    used_names.extend(a.level_params.iter());
+                    serde_json::json!({ "axiom": a })
+                }
+                Decl::Quot(a) => {
+                    let mut a = a.clone();
+                    a.r#type = ty(a.name).unwrap_or(0) as u32;
+                    used_names.extend(a.level_params.iter());
+                    serde_json::json!({ "quot": a })
+                }
+                Decl::Def(a) => {
+                    let mut a = a.clone();
+                    a.r#type = ty(a.name).unwrap_or(0) as u32;
+                    if let Some((_, crate::env::ConstInfo { kind: Kind::Def { val, .. }, .. })) = table.get(&a.name) {
+                        a.value = ids[val] as u32;
+                    }
+                    used_names.extend(a.level_params.iter().chain(a.all.iter()));
+                    serde_json::json!({ "def": a })
+                }
+                Decl::Thm(a) => {
+                    used_names.extend(a.level_params.iter().chain(a.all.iter()));
+                    match table.get(&a.name).map(|(_, c)| &c.kind) {
+                        Some(Kind::Thm { val }) if *val != DROPPED => {
+                            let mut a = a.clone();
+                            a.r#type = ty(a.name).unwrap_or(0) as u32;
+                            a.value = ids[val] as u32;
+                            serde_json::json!({ "thm": a })
+                        }
+                        _ => serde_json::json!({ "axiom": ex::AxiomVal {
+                            name: a.name, level_params: a.level_params.clone(), r#type: ty(a.name).unwrap_or(0) as u32, is_unsafe: false } }),
+                    }
+                }
+                Decl::Opaque(a) => {
+                    used_names.extend(a.level_params.iter());
+                    serde_json::json!({ "axiom": ex::AxiomVal {
+                        name: a.name, level_params: a.level_params.clone(), r#type: ty(a.name).unwrap_or(0) as u32, is_unsafe: false } })
+                }
+                Decl::Inductive(b) => {
+                    let mut b = b.clone();
+                    for t in &mut b.types {
+                        t.r#type = ty(t.name).unwrap_or(0) as u32;
+                        used_names.extend(t.level_params.iter().chain(t.all.iter()).chain(t.ctors.iter()));
+                    }
+                    for c in &mut b.ctors {
+                        c.r#type = ty(c.name).unwrap_or(0) as u32;
+                        used_names.insert(c.induct);
+                        used_names.extend(c.level_params.iter());
+                    }
+                    for r in &mut b.recs {
+                        r.r#type = ty(r.name).unwrap_or(0) as u32;
+                        used_names.extend(r.level_params.iter().chain(r.all.iter()));
+                        if let Some((_, crate::env::ConstInfo { kind: Kind::Rec { rules, .. }, .. })) =
+                            table.get(&r.name)
+                        {
+                            for rule in &mut r.rules {
+                                used_names.insert(rule.ctor);
+                                if let Some(k) = rules.iter().find(|x| x.ctor == rule.ctor) {
+                                    rule.rhs = ids[&k.rhs] as u32;
+                                }
+                            }
+                        }
+                    }
+                    serde_json::json!({ "inductive": b })
+                }
+            };
+            decl_lines.push(line.to_string());
+        }
+        // Names, prefixes first, with their original ids.
+        let mut all_names: std::collections::BTreeSet<NameId> = Default::default();
+        for &n in &used_names {
+            let mut m = n;
+            while m != 0 && all_names.insert(m) {
+                m = match &seen.names[m as usize] {
+                    ex::Name::Str { pre, .. } | ex::Name::Num { pre, .. } => *pre,
+                    ex::Name::Anon => 0,
+                };
+            }
+        }
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        writeln!(
+            f,
+            r#"{{"meta":{{"exporter":{{"name":"certus-extract","version":"0"}},"format":{{"version":"3.1.0"}},"lean":{{"githash":"","version":"4.33.1"}}}}}}"#
+        )?;
+        for &n in &all_names {
+            match &seen.names[n as usize] {
+                ex::Name::Str { pre, s } => writeln!(
+                    f,
+                    r#"{{"in":{n},"str":{{"pre":{pre},"str":{}}}}}"#,
+                    serde_json::to_string(s).unwrap_or_default()
+                )?,
+                ex::Name::Num { pre, n: i } => writeln!(f, r#"{{"in":{n},"num":{{"i":{i},"pre":{pre}}}}}"#)?,
+                ex::Name::Anon => {}
+            }
+        }
+        for l in level_lines.iter().chain(&expr_lines).chain(&decl_lines) {
+            writeln!(f, "{l}")?;
+        }
+        f.flush()?;
+        Ok(positions.len())
     }
 }
 
@@ -561,6 +852,11 @@ pub fn check_stream(open: &Open, jobs: usize) -> Result<Report, CheckError> {
         times: Vec::new(),
         progress: std::env::var_os("CERTUS_PROGRESS").is_some(),
         started: start,
+        zone_end: usize::MAX,
+        extract: std::env::var("CERTUS_EXTRACT")
+            .ok()
+            .and_then(|s| s.split_once(':').map(|(a, b)| (a.to_string(), b.to_string()))),
+        decls_meta: Vec::new(),
     };
     c.persist = c.st.num_nodes();
     // Tests set a tiny batch (1: compact after every declaration).
