@@ -58,7 +58,7 @@ Status key: ⬜ not started · 🟨 started · 🟩 measured win · ➖ out of s
 
 | # | Axis | Measure | Best today | Lean 4 | Certus target | Status |
 |---|---|---|---|---|---|---|
-| 31 | Library breadth | Areas covered | **Lean Mathlib** | Best | All of Mathlib, day one | ⬜ Phase 1 |
+| 31 | Library breadth | Areas covered | **Lean Mathlib** | Best | All of Mathlib, day one | 🟨 Certus checks every one of 147 randomly sampled Mathlib closures, up to 53,809 declarations each, 1.5× faster than nanoda and 7× faster than Lean's kernel ([evidence](HYPOTHESES.md#e1-and-e2-on-mathlib-free-github-actions-runners)) |
 | 32 | Library coherence | Unified conventions | **Lean Mathlib** | Strong | Inherit Mathlib | ⬜ |
 | 33 | Stability | Old proofs keep working | Isabelle, Rocq | Monthly breaking releases | Certificates are permanent | ⬜ |
 | 34 | Portability | Export and translation | Dedukti ecosystem | lean4export only | Export to Dedukti and MM0 | ⬜ |

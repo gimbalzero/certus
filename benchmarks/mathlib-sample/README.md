@@ -12,7 +12,7 @@ The workflow is [`.github/workflows/mathlib-sample.yml`](../../.github/workflows
 
 ## Results
 
-The latest committed run is in [`results/results.md`](results/results.md) (and `results.json`). The summary and the H1 verdict are in [`docs/HYPOTHESES.md`](../../docs/HYPOTHESES.md#evidence-so-far).
+Committed runs: [`results/results.md`](results/results.md) (seed 12, 50 modules) and [`results/seed23-n100/results.md`](results/seed23-n100/results.md) (seed 23, 100 modules), each with its `results.json`. The summary and the H1 verdict are in [`docs/HYPOTHESES.md`](../../docs/HYPOTHESES.md#evidence-so-far).
 
 ## What it does
 

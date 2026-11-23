@@ -52,6 +52,13 @@ From [`benchmarks/mathlib-sample`](../benchmarks/mathlib-sample) ([results](../b
 - **Whole-closure replays.** The median module's dependency closure is 4,942 declarations (max 45,959), a 23 MB export. nanoda replays each full closure, back to `Init`, in a total of 83 s wall and 243 CPU-s for 49 modules, against 106 s to elaborate just those 49 modules. Lean's kernel (`leanchecker --from-export`) needs 367 s for the same closures.
 - **Certus checks all 49 of 49 closures**, with no rejections, timeouts or crashes (run https://github.com/gimbalzero/certus/actions/runs/44998000065). It was 3 of 49 before nested inductive types (#25), then 44 of 49 before the string-literal (#13) and index-counting (#29) fixes.
 
+**A second, larger sample** (seed 23, 100 modules, [results](../benchmarks/mathlib-sample/results/seed23-n100/results.md), [run](https://github.com/gimbalzero/certus/actions/runs/45089250507), 23 Nov 2026) agrees:
+
+- the kernel is **5.1%** (3.8–6.7%) of profiled time, and search 47.7% (45.1–49.9%);
+- replaying each module's own declarations through Lean's kernel takes 6.7% (5.0–8.8%) of elaboration time.
+- **Certus accepts all 98 exported closures**, with no rejections, timeouts or crashes. 97 of them contain a nested inductive type, and the median closure has 6,420 declarations (max 53,809).
+- Checking all 98 whole closures, back to `Init`, on the same 4-core runners took Certus **146 s**, nanoda 222 s and Lean's kernel (`leanchecker --from-export`) 1,022 s.
+
 Caveats: most Mathlib files are small, so per-file imports and fixed costs weigh heavily here; W measures only waiting inside one file, not idle cores across a whole build; times come from one run on shared cloud machines, timed to about 50 ms.
 
 ### Phase 0, one laptop
