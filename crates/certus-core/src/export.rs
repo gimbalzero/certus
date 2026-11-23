@@ -690,6 +690,193 @@ pub fn parse_batched<R: BufRead>(mut reader: R, jobs: usize, batch: usize) -> Re
     })
 }
 
+/// A strict fast path for the commonest record shapes, exactly as lean4export
+/// writes them (keys in its order, no spaces). It returns what `serde_json`
+/// followed by `classify` would, or `None` to leave the line to them:
+/// any other shape, a leading zero, a number out of range, an escape or a
+/// control character in a string all fall back, so the reader stays exactly
+/// as strict as before. Most lines of an export are `app` nodes, so this is
+/// most of the parsing time.
+fn fast(b: &[u8]) -> Option<Rec> {
+    let mut c = Cur { b, i: 0 };
+    let r = if c.lit(b"{\"app\":{\"arg\":") {
+        let a = c.u32()?;
+        c.expect(b",\"fn\":")?;
+        let f = c.u32()?;
+        c.expect(b"},\"ie\":")?;
+        let id = c.u32()?;
+        c.expect(b"}")?;
+        Rec::Expr { id, e: Expr::App { f, a } }
+    } else if c.lit(b"{\"ie\":") {
+        let id = c.u32()?;
+        if c.lit(b",\"lam\":{\"binderInfo\":") {
+            let (bi, body, name, ty) = c.binder()?;
+            c.expect(b"}}")?;
+            Rec::Expr { id, e: Expr::Lam { name, ty, body, bi } }
+        } else if c.lit(b",\"letE\":{\"body\":") {
+            let body = c.u32()?;
+            c.expect(b",\"name\":")?;
+            let name = c.u32()?;
+            c.expect(b",\"nondep\":")?;
+            let nondep = if c.lit(b"true") {
+                true
+            } else {
+                c.expect(b"false")?;
+                false
+            };
+            c.expect(b",\"type\":")?;
+            let ty = c.u32()?;
+            c.expect(b",\"value\":")?;
+            let val = c.u32()?;
+            c.expect(b"}}")?;
+            Rec::Expr { id, e: Expr::Let { name, ty, val, body, nondep } }
+        } else if c.lit(b",\"proj\":{\"idx\":") {
+            let idx = c.u64()?;
+            c.expect(b",\"struct\":")?;
+            let structure = c.u32()?;
+            c.expect(b",\"typeName\":")?;
+            let type_name = c.u32()?;
+            c.expect(b"}}")?;
+            Rec::Expr { id, e: Expr::Proj { type_name, idx, structure } }
+        } else if c.lit(b",\"sort\":") {
+            let l = c.u32()?;
+            c.expect(b"}")?;
+            Rec::Expr { id, e: Expr::Sort(l) }
+        } else {
+            return None;
+        }
+    } else if c.lit(b"{\"forallE\":{\"binderInfo\":") {
+        let (bi, body, name, ty) = c.binder()?;
+        c.expect(b"},\"ie\":")?;
+        let id = c.u32()?;
+        c.expect(b"}")?;
+        Rec::Expr { id, e: Expr::Pi { name, ty, body, bi } }
+    } else if c.lit(b"{\"const\":{\"name\":") {
+        let name = c.u32()?;
+        c.expect(b",\"us\":[")?;
+        let mut us = Vec::new();
+        if !c.lit(b"]") {
+            loop {
+                us.push(c.u32()?);
+                if c.lit(b"]") {
+                    break;
+                }
+                c.expect(b",")?;
+            }
+        }
+        c.expect(b"},\"ie\":")?;
+        let id = c.u32()?;
+        c.expect(b"}")?;
+        Rec::Expr { id, e: Expr::Const { name, levels: us.into_boxed_slice() } }
+    } else if c.lit(b"{\"bvar\":") {
+        let i = c.u64()?;
+        c.expect(b",\"ie\":")?;
+        let id = c.u32()?;
+        c.expect(b"}")?;
+        Rec::Expr { id, e: Expr::BVar(i) }
+    } else if c.lit(b"{\"in\":") {
+        let id = c.u32()?;
+        if c.lit(b",\"num\":{\"i\":") {
+            let n = c.u64()?;
+            c.expect(b",\"pre\":")?;
+            let pre = c.u32()?;
+            c.expect(b"}}")?;
+            Rec::Name { id, name: Name::Num { pre, n } }
+        } else if c.lit(b",\"str\":{\"pre\":") {
+            let pre = c.u32()?;
+            c.expect(b",\"str\":\"")?;
+            let start = c.i;
+            while c.i < b.len() && b[c.i] != b'"' {
+                if b[c.i] == b'\\' || b[c.i] < 0x20 {
+                    return None;
+                }
+                c.i += 1;
+            }
+            let s = std::str::from_utf8(&b[start..c.i]).ok()?.to_string();
+            c.expect(b"\"}}")?;
+            Rec::Name { id, name: Name::Str { pre, s } }
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    (c.i == b.len()).then_some(r)
+}
+
+struct Cur<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl Cur<'_> {
+    fn lit(&mut self, s: &[u8]) -> bool {
+        if self.b[self.i..].starts_with(s) {
+            self.i += s.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, s: &[u8]) -> Option<()> {
+        self.lit(s).then_some(())
+    }
+
+    /// A JSON natural number as `serde_json` reads it into a `u64`: no
+    /// sign, no leading zero, no fraction or exponent.
+    fn u64(&mut self) -> Option<u64> {
+        let start = self.i;
+        let mut v: u64 = 0;
+        while self.i < self.b.len() && self.b[self.i].is_ascii_digit() {
+            v = v.checked_mul(10)?.checked_add((self.b[self.i] - b'0') as u64)?;
+            self.i += 1;
+        }
+        let len = self.i - start;
+        if len == 0 || (len > 1 && self.b[start] == b'0') {
+            return None;
+        }
+        if self.i < self.b.len() && matches!(self.b[self.i], b'.' | b'e' | b'E') {
+            return None;
+        }
+        Some(v)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        u32::try_from(self.u64()?).ok()
+    }
+
+    /// `"<binder info>","body":B,"name":N,"type":T`, after `"binderInfo":`.
+    fn binder(&mut self) -> Option<(BinderInfo, u32, u32, u32)> {
+        let bi = if self.lit(b"\"default\"") {
+            BinderInfo::Default
+        } else if self.lit(b"\"implicit\"") {
+            BinderInfo::Implicit
+        } else if self.lit(b"\"instImplicit\"") {
+            BinderInfo::InstImplicit
+        } else if self.lit(b"\"strictImplicit\"") {
+            BinderInfo::StrictImplicit
+        } else {
+            return None;
+        };
+        self.expect(b",\"body\":")?;
+        let body = self.u32()?;
+        self.expect(b",\"name\":")?;
+        let name = self.u32()?;
+        self.expect(b",\"type\":")?;
+        let ty = self.u32()?;
+        Some((bi, body, name, ty))
+    }
+}
+
+/// Whether to use [`fast`] (tests turn it off to compare).
+static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_fast_path_for_tests(on: bool) {
+    FAST.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Split `block` into at most `n` pieces of whole lines.
 fn split_lines(block: &[u8], n: usize) -> Vec<&[u8]> {
     let mut out = Vec::with_capacity(n);
@@ -730,9 +917,13 @@ fn decode(piece: &[u8], file_start: bool) -> (Vec<Decoded>, u64) {
         if text.is_empty() {
             continue;
         }
-        let rec = serde_json::from_str::<Line>(text)
-            .map_err(|e| e.to_string())
-            .and_then(|r| classify(r, file_start && n == 1));
+        let first = file_start && n == 1;
+        let quick =
+            if first || !FAST.load(std::sync::atomic::Ordering::Relaxed) { None } else { fast(text.as_bytes()) };
+        let rec = match quick {
+            Some(r) => Ok(r),
+            None => serde_json::from_str::<Line>(text).map_err(|e| e.to_string()).and_then(|r| classify(r, first)),
+        };
         let bad = rec.is_err();
         out.push((n, rec));
         if bad {
@@ -855,6 +1046,7 @@ impl Builder {
 }
 
 /// A record, checked as far as it can be on its own; ids are still the file's.
+#[derive(Debug)]
 enum Rec {
     Meta(Box<Meta>),
     Name { id: u32, name: Name },
@@ -1048,5 +1240,81 @@ impl Env {
             }
         }
         found
+    }
+}
+
+#[cfg(test)]
+mod fast_tests {
+    use super::*;
+
+    fn slow(line: &str) -> Result<Rec, String> {
+        serde_json::from_str::<Line>(line).map_err(|e| e.to_string()).and_then(|r| classify(r, false))
+    }
+
+    /// Whatever the fast path accepts, the strict reader accepts the same way.
+    fn agrees(line: &str) -> bool {
+        match fast(line.as_bytes()) {
+            None => false,
+            Some(r) => {
+                let s = slow(line).unwrap_or_else(|e| panic!("fast path accepted {line:?}, strict reader says {e}"));
+                assert_eq!(format!("{r:?}"), format!("{s:?}"), "{line}");
+                true
+            }
+        }
+    }
+
+    #[test]
+    fn the_fast_path_reads_every_common_shape_as_the_strict_reader_does() {
+        for line in [
+            r#"{"app":{"arg":2,"fn":7},"ie":8}"#,
+            r#"{"app":{"arg":0,"fn":4294967295},"ie":4294967295}"#,
+            r#"{"ie":38,"lam":{"binderInfo":"default","body":1,"name":14,"type":24}}"#,
+            r#"{"ie":38,"lam":{"binderInfo":"strictImplicit","body":1,"name":14,"type":24}}"#,
+            r#"{"forallE":{"binderInfo":"instImplicit","body":141,"name":38,"type":138},"ie":166}"#,
+            r#"{"forallE":{"binderInfo":"implicit","body":5,"name":3,"type":0},"ie":6}"#,
+            r#"{"const":{"name":1,"us":[1]},"ie":7}"#,
+            r#"{"const":{"name":61,"us":[]},"ie":316}"#,
+            r#"{"const":{"name":3090,"us":[12,12,12,12,12]},"ie":16855}"#,
+            r#"{"in":8,"num":{"i":18446744073709551615,"pre":7}}"#,
+            r#"{"in":7,"str":{"pre":6,"str":"_hyg"}}"#,
+            r#"{"in":7,"str":{"pre":6,"str":"α₁ ∀"}}"#,
+            r#"{"in":7,"str":{"pre":6,"str":""}}"#,
+            r#"{"ie":3312,"letE":{"body":3311,"name":760,"nondep":false,"type":3266,"value":3302}}"#,
+            r#"{"ie":3312,"letE":{"body":3311,"name":760,"nondep":true,"type":3266,"value":3302}}"#,
+            r#"{"ie":170,"proj":{"idx":0,"struct":1,"typeName":31}}"#,
+            r#"{"bvar":0,"ie":1}"#,
+            r#"{"ie":0,"sort":1}"#,
+        ] {
+            assert!(agrees(line), "the fast path should read {line}");
+        }
+    }
+
+    #[test]
+    fn anything_unusual_is_left_to_the_strict_reader() {
+        for line in [
+            r#"{"app":{"arg":01,"fn":2},"ie":3}"#,
+            r#"{"app":{"arg":1,"fn":2},"ie":4294967296}"#,
+            r#"{"app":{"arg":1e2,"fn":2},"ie":3}"#,
+            r#"{"app":{"arg":1.0,"fn":2},"ie":3}"#,
+            r#"{"app":{"arg":-1,"fn":2},"ie":3}"#,
+            r#"{"app": {"arg":1,"fn":2},"ie":3}"#,
+            r#"{"app":{"fn":2,"arg":1},"ie":3}"#,
+            r#"{"app":{"arg":1,"fn":2},"ie":3,"x":1}"#,
+            r#"{"app":{"arg":1,"fn":2},"ie":3}x"#,
+            r#"{"app":{"arg":1,"fn":2},"ie":3}}"#,
+            r#"{"app":{"arg":1,"fn":2}}"#,
+            r#"{"ie":1,"lam":{"binderInfo":"auto","body":1,"name":1,"type":1}}"#,
+            r#"{"in":7,"str":{"pre":6,"str":"a\"b"}}"#,
+            r#"{"in":7,"str":{"pre":6,"str":"a\u0041"}}"#,
+            r#"{"in":7,"num":{"i":18446744073709551616,"pre":7}}"#,
+            r#"{"const":{"name":1,"us":[1,]},"ie":7}"#,
+            r#"{"const":{"name":1,"us":[,1]},"ie":7}"#,
+            r#"{"ie":1,"letE":{"body":1,"name":1,"nondep":null,"type":1,"value":1}}"#,
+            r#"{"ie":1,"sort":1,"sort":2}"#,
+        ] {
+            // Either the fast path declines, or (checked inside) it agrees.
+            let _ = agrees(line);
+            assert!(fast(line.as_bytes()).is_none(), "the fast path must decline {line}");
+        }
     }
 }

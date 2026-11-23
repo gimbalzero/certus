@@ -1,7 +1,7 @@
 //! Parsing on several threads gives exactly the environment, or exactly the
 //! first error, that parsing on one thread gives.
 
-use certus_core::export::{parse_batched, parse_jobs};
+use certus_core::export::{parse_batched, parse_jobs, set_fast_path_for_tests};
 
 fn fixtures() -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
@@ -87,5 +87,16 @@ fn tiny_batches_split_lines_across_batches_and_give_the_same_result() {
         for (jobs, batch) in [(1, 1), (3, 7), (4, 64), (2, 300)] {
             assert_eq!(one, show(parse_batched(&text[..], jobs, batch)), "{name}, {jobs} threads, batch {batch}");
         }
+    }
+}
+
+#[test]
+fn the_fast_path_changes_nothing() {
+    for (name, text) in fixtures() {
+        let fast = outcome(&text, 3);
+        set_fast_path_for_tests(false);
+        let slow = outcome(&text, 3);
+        set_fast_path_for_tests(true);
+        assert_eq!(fast, slow, "{name}");
     }
 }
