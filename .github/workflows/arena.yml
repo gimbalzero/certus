@@ -47,6 +47,7 @@ jobs:
           --memory-limit 6
           --json arena-${{ matrix.suite }}.json
           --summary "$GITHUB_STEP_SUMMARY"
+          ${{ matrix.suite == 'round-2026-09' && '--strict' || '' }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:

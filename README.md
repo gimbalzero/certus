@@ -8,7 +8,7 @@ Certus separates the two. **Search once, check forever.** The author's machine p
 
 The goal: **minutes on a laptop instead of days on a server**, and the best system on every one of the [44 axes](docs/SCOREBOARD.md) we track.
 
-> **Status: Phase 1 targets met.** Certus type-checks Lean proofs from scratch and regenerates every recursor rather than trusting it. It checks all of Lean's core library in 4.2 s on a laptop, faster than nanoda (6.5 s in the same session). It re-checks an unchanged library in 0.2 s from its verdict cache, and agrees with every Lean Kernel Arena test. See the [plan](docs/PLAN.md).
+> **Status: Phase 1 targets met.** Certus type-checks Lean proofs from scratch and regenerates every recursor rather than trusting it. It checks all of Lean's core library in 3.9 s on a laptop, faster than nanoda (6.6 s in the same session). It re-checks an unchanged library in 0.2 s from its verdict cache, and agrees with every Lean Kernel Arena test. See the [plan](docs/PLAN.md).
 
 ## The race
 
@@ -46,7 +46,7 @@ Exports come from [`lean4export`](https://github.com/leanprover/lean4export) (fo
 
 ## Lean Kernel Arena
 
-CI runs the [Lean Kernel Arena](https://arena.lean-lang.org) test suite on every pull request ([workflow](.github/workflows/arena.yml)). These are the community's export files that a correct checker must accept or reject. The run fails on any new false acceptance. A false acceptance that is already tracked by a `soundness` issue is listed in [`known-unsound.txt`](tests/arena/known-unsound.txt) and is still reported in every run. False rejections are listed in the job summary, and each cause has its own issue. To run it locally:
+CI runs the [Lean Kernel Arena](https://arena.lean-lang.org) test suite on every pull request ([workflow](.github/workflows/arena.yml)). These are the community's export files that a correct checker must accept or reject. The run fails on any new false acceptance. On the pinned round 2026-09 it also fails on any false rejection, error or timeout, since Certus gets every one of those tests right. A false acceptance that is already tracked by a `soundness` issue is listed in [`known-unsound.txt`](tests/arena/known-unsound.txt) and is still reported in every run. False rejections are listed in the job summary, and each cause has its own issue. To run it locally:
 
 ```bash
 cargo build --release
@@ -62,17 +62,17 @@ The 348 MB export of Lean 4.36's core library (58,547 declarations, 6.5M records
 
 | | |
 |---|---|
-| Type-check all of it (8 threads) | **4.2 s** (nanoda: 6.5 s) |
-| ... on 1 thread | **16.2 s** (nanoda: 21.8 s) |
+| Type-check all of it (8 threads) | **3.9 s** (nanoda: 6.6 s) |
+| ... on 1 thread | **16.1 s** (nanoda: 22.2 s) |
 | Re-check it, unchanged | **0.22 s** |
 | Re-check it after one declaration changed | **2.4 s** |
 | Parse 6.5M records | **0.8 s** (430 MB/s) |
 | Hash 6.5M nodes | **0.7 s** |
-| Peak memory, full check | **1.0 GB** |
+| Peak memory, full check | **0.8 GB** (nanoda: 0.7 GB) |
 | Declarations an automated proof of Σk = n(n+1)/2 depends on | **1,341 of 58,555 (2.3%)** |
 | ... with the same proof written out explicitly | **83 of 58,555 (0.1%)** |
 
-From the [Lean vs Metamath benchmark](benchmarks/proof-bench), about **92%** of Lean's build time for those proofs goes to search, not checking. Other independent checkers re-check all 58,555 core declarations every time (nanoda: 6.5 s on 8 cores) before reaching a single user proof. Details are in [HYPOTHESES.md](docs/HYPOTHESES.md).
+From the [Lean vs Metamath benchmark](benchmarks/proof-bench), about **92%** of Lean's build time for those proofs goes to search, not checking. Other independent checkers re-check all 58,555 core declarations every time (nanoda: 6.6 s on 8 cores) before reaching a single user proof. Details are in [HYPOTHESES.md](docs/HYPOTHESES.md).
 
 ## Roadmap
 

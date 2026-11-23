@@ -100,14 +100,14 @@ Current `main` against nanoda (built at the race's pinned commit), Apple M2 (8 c
 
 | Checker | Wall time | CPU time | Peak memory |
 |---|---|---|---|
-| **Certus** (8 threads) | **4.2 s** | **24.0 s** | 0.96 GB |
-| nanoda (8 threads) | 6.5 s | 31.7 s | 0.74 GB |
-| **Certus** (1 thread) | **16.2 s** | **18.1 s** | 1.07 GB |
-| nanoda (1 thread) | 21.8 s | 21.4 s | 0.62 GB |
+| **Certus** (8 threads) | **3.9 s** | **21.5 s** | 0.79 GB |
+| nanoda (8 threads) | 6.6 s | 32.0 s | 0.69–0.74 GB |
+| **Certus** (1 thread) | **16.1 s** | **18.0 s** | 0.78 GB |
+| nanoda (1 thread) | 22.2 s | 21.6 s | 0.63–0.71 GB |
 | **Certus, re-check of an unchanged export** (verdict cache) | **0.22 s** | 0.20 s | 0.02 GB |
 | Certus, re-check after an edit (one declaration not cached) | 2.4 s | 6.0 s | 1.06 GB |
 
-Certus is now faster than nanoda on the clock and in CPU on both 1 and 8 threads, and re-checks an unchanged library in a fifth of a second. nanoda still uses less memory. The gains since the table below came from parsing and hashing on all cores (#47), forgetting each check's terms once it is over (#48), and the whole-export cache entry (#45).
+Certus is faster than nanoda on the clock and in CPU on both 1 and 8 threads, and re-checks an unchanged library in a fifth of a second. nanoda still uses slightly less memory. The gains since the table below came from parsing and hashing on all cores (#47), forgetting each check's terms once it is over (#48), a smaller term store (#52), and the whole-export cache entry (#45). The checker rows were re-measured together after #52; the re-check rows are from before it.
 
 Earlier measurement, Apple M2 (8 cores), 22 Nov 2026, one run each, all in the same session:
 
