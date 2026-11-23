@@ -80,3 +80,23 @@ fn rejects_a_recursor_with_the_wrong_index_count() {
     b["recs"][0]["numIndices"] = 1.into();
     rejected(&c.text(), "recursor");
 }
+
+/// `fixtures/self_unfolding_def.ndjson` is the certificate above with `Pred`'s
+/// value replaced by a term that mentions `Pred` (found by mutation
+/// fuzzing). Phase 1 admits definitions before their values are checked, so
+/// checking the inductive `Image`, whose type reaches its index through
+/// `Pred`, used to unfold `Pred` forever. It must stop, and the verdict is
+/// the earliest failure: `Pred` itself.
+#[test]
+fn a_definition_that_unfolds_forever_is_rejected_promptly() {
+    let text = include_str!("fixtures/self_unfolding_def.ndjson");
+    let env = parse(text.as_bytes()).expect("export parses");
+    let all: Vec<usize> = (0..env.decls.len()).collect();
+    let t = std::time::Instant::now();
+    for jobs in [1, 4] {
+        let e = certus_kernel::check_jobs(&env, &all, jobs).expect_err("must be rejected");
+        assert!(!e.resource, "a rejection, not a resource limit: {e}");
+        assert!(e.to_string().contains("Pred"), "{e}");
+    }
+    assert!(t.elapsed().as_secs() < 30, "took {:?}", t.elapsed());
+}

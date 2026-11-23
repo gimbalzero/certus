@@ -7,7 +7,7 @@
 //! which the term store ignores).
 
 use crate::env::{ConstInfo, Kind, RecRule};
-use crate::tc::{R, TC};
+use crate::tc::{KError, R, TC};
 use crate::term::{E, L, Level, Node, Store};
 use certus_core::export::{Name, NameId};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -483,6 +483,9 @@ impl Elim<'_, '_> {
     }
 }
 
+/// See `Checker::telescope_step`.
+const MAX_TELESCOPE: usize = 1 << 16;
+
 fn count_pis(st: &Store, mut e: E) -> usize {
     let mut n = 0;
     while let Node::Pi(_, b) = st.node(e) {
@@ -673,6 +676,12 @@ impl Checker<'_, '_> {
             let mut nidx = 0u32;
             let mut idx_fvars = Vec::new();
             while let Node::Pi(d, b) = self.tc.st.node(ty) {
+                // More binders than declared parameters and indices is an
+                // error whether or not the telescope ends; stopping here also
+                // stops one that unfolds forever (`P := Nat → P`).
+                if i >= self.np + t.num_indices as usize {
+                    return Err("inductive type: wrong number of indices".into());
+                }
                 if i < self.np {
                     if ti == 0 {
                         let p = self.local_for(d);
@@ -728,6 +737,21 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
+    /// One more binder of a telescope reached through `whnf`, whose length is
+    /// not declared (a constructor field's type). A definition that unfolds
+    /// forever (`P := Nat → P`) would give an endless telescope, and the
+    /// `whnf` calls are cached, so they need not use up the work budget: each
+    /// binder spends some of it, and an absurdly long telescope is a resource
+    /// error (no verdict), never a rejection of something valid.
+    fn telescope_step(&mut self, n: &mut usize) -> R<()> {
+        self.tc.burn()?;
+        *n += 1;
+        if *n > MAX_TELESCOPE {
+            return Err(KError::Resource(format!("a type has more than {MAX_TELESCOPE} binders")));
+        }
+        Ok(())
+    }
+
     /// A free variable for a binder of type `d` (annotations stripped, as in Lean).
     fn local_for(&mut self, d: E) -> E {
         let d = self.tc.consume_annotations(d);
@@ -766,7 +790,9 @@ impl Checker<'_, '_> {
 
     fn is_rec_argument(&mut self, ty: E) -> R<Option<usize>> {
         let mut t = self.tc.whnf(ty)?;
+        let mut n = 0usize;
         while let Node::Pi(d, b) = self.tc.st.node(t) {
+            self.telescope_step(&mut n)?;
             let x = self.local_for(d);
             let t2 = self.st().instantiate_rev(b, &[x]);
             t = self.tc.whnf(t2)?;
@@ -916,7 +942,9 @@ impl Checker<'_, '_> {
         let uty = self.fvar_type(u);
         let mut t = self.tc.whnf(uty)?;
         let mut xs = Vec::new();
+        let mut n = 0usize;
         while let Node::Pi(d, b) = self.tc.st.node(t) {
+            self.telescope_step(&mut n)?;
             let x = self.local_for(d);
             xs.push(x);
             let t2 = self.st().instantiate_rev(b, &[x]);
@@ -968,6 +996,10 @@ impl Checker<'_, '_> {
             let mut i = 0usize;
             let mut idx = Vec::new();
             while let Node::Pi(d, b) = self.tc.st.node(ty) {
+                // `check_types` accepted at most this many binders.
+                if i >= self.np + t.num_indices as usize {
+                    return Err("inductive type: wrong number of indices".into());
+                }
                 if i < self.np {
                     let p = self.params[i];
                     ty = self.st().instantiate_rev(b, &[p]);
