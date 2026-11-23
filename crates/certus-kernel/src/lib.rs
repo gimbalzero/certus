@@ -17,6 +17,7 @@ pub mod check;
 pub mod env;
 pub mod inductive;
 pub mod quot;
+pub mod stream;
 pub mod tc;
 pub mod term;
 

@@ -100,3 +100,38 @@ fn the_fast_path_changes_nothing() {
         assert_eq!(fast, slow, "{name}");
     }
 }
+
+#[test]
+fn streaming_hands_out_exactly_what_parsing_stores() {
+    use certus_core::export::{Item, stream};
+    for (name, text) in fixtures() {
+        let Ok(env) = parse_jobs(&text[..], 2) else { continue };
+        let (mut exprs, mut decls) = (Vec::new(), Vec::new());
+        let mut batches = 0;
+        let end = stream(&text[..], 3, &mut |seen, items| {
+            batches += 1;
+            for it in items {
+                match it {
+                    Item::Expr(id, e) => {
+                        assert_eq!(id as usize, exprs.len(), "{name}: expressions in order");
+                        exprs.push(e);
+                    }
+                    Item::Decl(d) => decls.push(d),
+                }
+            }
+            assert_eq!(seen.exprs, exprs.len());
+            assert_eq!(seen.decls, decls.len());
+            Ok(())
+        })
+        .expect("streams");
+        assert!(batches >= 1);
+        assert_eq!(format!("{:?}", env.exprs), format!("{exprs:?}"), "{name}");
+        assert_eq!(format!("{:?}", env.decls), format!("{decls:?}"), "{name}");
+        assert_eq!(format!("{:?}", env.names), format!("{:?}", end.names), "{name}");
+        assert_eq!(format!("{:?}", env.levels), format!("{:?}", end.levels), "{name}");
+        assert_eq!(
+            (env.exprs.len(), env.decls.len(), env.lines, env.bytes),
+            (end.exprs, end.decls, end.lines, end.bytes)
+        );
+    }
+}

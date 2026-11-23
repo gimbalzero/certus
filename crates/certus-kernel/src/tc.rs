@@ -57,6 +57,52 @@ impl From<String> for KError {
     }
 }
 
+/// The value of a theorem whose proof was not kept (see `TC::unfold`).
+pub const DROPPED: E = E(u32::MAX);
+
+thread_local! {
+    /// The last theorem this thread could not unfold because its proof was not
+    /// kept (see `TC::unfold`).
+    pub static MISSED_PROOF: std::cell::Cell<Option<NameId>> = const { std::cell::Cell::new(None) };
+}
+
+/// Debugging aid (`CERTUS_TRACE_UNFOLD`): every 4M unfoldings, print the
+/// constants this thread unfolded most (by name id).
+fn trace_unfold(n: NameId) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CERTUS_TRACE_UNFOLD").is_some()) {
+        return;
+    }
+    thread_local! {
+        static COUNTS: std::cell::RefCell<(u64, FxHashMap<NameId, u64>)> = Default::default();
+    }
+    COUNTS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0 += 1;
+        *c.1.entry(n).or_default() += 1;
+        if c.0 % (1 << 22) == 0 {
+            let mut v: Vec<(NameId, u64)> = c.1.iter().map(|(k, v)| (*k, *v)).collect();
+            v.sort_by_key(|x| std::cmp::Reverse(x.1));
+            v.truncate(12);
+            eprintln!("certus: unfold trace {:?}: {} unfoldings, top {v:?}", std::thread::current().name(), c.0);
+            c.1.clear();
+        }
+    });
+}
+
+/// `r`, except that a rejection after a missed proof (see `TC::unfold`) is
+/// a resource error: the proof might have made the check succeed. Resets the
+/// thread's note.
+pub fn unless_missed_proof<T>(r: R<T>) -> R<T> {
+    let missed = MISSED_PROOF.with(|m| m.take());
+    match (r, missed) {
+        (Err(KError::Invalid(msg)), Some(n)) => Err(KError::Resource(format!(
+            "a proof that was not kept may be needed (theorem #{n} was left folded; without it: {msg})"
+        ))),
+        (r, _) => r,
+    }
+}
+
 /// Default work budget per declaration. Exceeding it is an error, so a
 /// hostile proof can make Certus give up, but never make it accept.
 pub const DEFAULT_FUEL: u64 = 200_000_000;
@@ -126,6 +172,8 @@ pub struct TC<'a> {
     stack_limit: usize,
     eq_cache: FxHashSet<(E, E)>,
     neq_cache: FxHashSet<(E, E)>,
+    /// `nat_lit_value` of open terms: their literal, or `None`.
+    nat_open_cache: FxHashMap<E, Option<E>>,
     fuel: u64,
     /// Terms kept by all collections so far, and the collection threshold
     /// (see `end_region`).
@@ -136,6 +184,12 @@ pub struct TC<'a> {
 /// A reduction that creates at least this many terms has the ones nothing
 /// needs forgotten when it ends (see `TC::end_region`).
 pub const GC_MIN: usize = 1 << 21;
+
+/// `GC_MIN`, or `CERTUS_GC_MIN` from the environment (for experiments).
+fn gc_min_default() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CERTUS_GC_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(GC_MIN))
+}
 
 /// Threshold used instead of `GC_MIN` (0: none). For tests only: a small
 /// threshold makes collections happen on small inputs, so that tests can
@@ -182,10 +236,11 @@ impl<'a> TC<'a> {
             },
             eq_cache: FxHashSet::default(),
             neq_cache: FxHashSet::default(),
+            nat_open_cache: FxHashMap::default(),
             fuel: DEFAULT_FUEL,
             gc_kept: 0,
             gc_min: match GC_MIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-                0 => GC_MIN,
+                0 => gc_min_default(),
                 n => n,
             },
         }
@@ -604,6 +659,7 @@ impl<'a> TC<'a> {
         }
         drop((later, seen));
         let moved = self.st.collect(w, &live);
+        self.nat_open_cache.retain(|&k, v| k < w && v.is_none_or(|l| l < w));
         let fix = |e: E| if e < w { Some(e) } else { moved.get(&e).copied() };
         // Fix the caches in place (copying them would double their memory at
         // the moment memory is tightest). Entries whose key was kept get new
@@ -658,7 +714,7 @@ impl<'a> TC<'a> {
                 t = v;
                 break;
             }
-            match self.unfold(t1) {
+            match self.unfold(t1)? {
                 Some(u) => t = u,
                 None => {
                     t = t1;
@@ -672,20 +728,31 @@ impl<'a> TC<'a> {
     }
 
     /// Unfold the head constant if it is a definition or theorem.
-    fn unfold(&mut self, e: E) -> Option<E> {
+    /// `e` with its head constant unfolded, if it is a definition or a theorem.
+    /// A theorem whose proof was not kept (`crate::stream` forgets proofs
+    /// once checked) is left folded, as if it were an axiom, and the thread
+    /// notes it (`MISSED_PROOF`). That can only make checks fail, never
+    /// succeed wrongly: an acceptance stands, and a failure after a missed
+    /// proof is reported as a resource error, never a rejection.
+    fn unfold(&mut self, e: E) -> R<Option<E>> {
         let (f, args) = self.st.spine(e);
-        let Node::Const(n, ls) = self.st.node(f) else { return None };
-        let c = self.get_const(n)?;
+        let Node::Const(n, ls) = self.st.node(f) else { return Ok(None) };
+        let Some(c) = self.get_const(n) else { return Ok(None) };
         let val = match c.kind {
             Kind::Def { val, .. } | Kind::Thm { val } => val,
-            _ => return None,
+            _ => return Ok(None),
         };
+        if val == DROPPED {
+            MISSED_PROOF.with(|m| m.set(Some(n)));
+            return Ok(None);
+        }
+        trace_unfold(n);
         let ls: Vec<L> = self.st.list_of(ls).to_vec();
         if ls.len() != c.lparams.len() {
-            return None;
+            return Ok(None);
         }
         let v = self.st.instantiate_lparams(val, &c.lparams, &ls);
-        Some(self.st.apps(v, &args))
+        Ok(Some(self.st.apps(v, &args)))
     }
 
     /// Definitional height of the head constant, if it can be unfolded.
@@ -886,6 +953,24 @@ impl<'a> TC<'a> {
     /// just `42`. Anything else is not a literal (`None`), so the caller
     /// falls back to ordinary reduction, exactly as without native arithmetic.
     fn nat_lit_value(&mut self, e: E) -> R<Option<BigUint>> {
+        if !self.st.info(e).has_fvar {
+            return self.closed_nat_lit_value(e);
+        }
+        // Each open term is probed once: a nested open computation would
+        // otherwise probe the same arguments again at every level.
+        if let Some(&r) = self.nat_open_cache.get(&e) {
+            return Ok(r.map(|l| match self.st.node(l) {
+                Node::Nat(i) => self.st.nat_val(i).clone(),
+                _ => BigUint::zero(),
+            }));
+        }
+        let v = self.probe_open_nat(e)?;
+        let lit = v.as_ref().map(|v| self.st.nat(v.clone()));
+        self.nat_open_cache.insert(e, lit);
+        Ok(v)
+    }
+
+    fn probe_open_nat(&mut self, e: E) -> R<Option<BigUint>> {
         let mut t = e;
         loop {
             if !self.st.info(t).has_fvar {
@@ -908,11 +993,48 @@ impl<'a> TC<'a> {
                     });
                 }
             }
-            match self.unfold(t1) {
+            match self.unfold(t1)? {
                 Some(u) => t = u,
                 None => return Ok(None),
             }
         }
+    }
+
+    /// Debugging aid (`CERTUS_TRACE_NAT`): why a `Nat` operation could not be
+    /// computed natively: the head of the argument that is not a literal.
+    fn trace_nat(&mut self, arg: E) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("CERTUS_TRACE_NAT").is_some()) {
+            return;
+        }
+        thread_local! {
+            static COUNTS: std::cell::RefCell<(u64, FxHashMap<String, u64>)> = Default::default();
+        }
+        let w = self.whnf_core(arg).unwrap_or(arg);
+        let key = match self.st.node(self.st.head(w)) {
+            Node::Const(n, _) => format!("const #{n}{}", if self.st.info(w).has_fvar { " (open)" } else { "" }),
+            Node::FVar(_) => "free variable".to_string(),
+            Node::BVar(_) => "bound variable".to_string(),
+            Node::Proj(s, i, _) => format!("projection #{s}.{i}"),
+            Node::Lam(..) => "lambda".to_string(),
+            n => format!("{n:?}").chars().take(20).collect(),
+        };
+        COUNTS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.0 += 1;
+            *c.1.entry(key).or_default() += 1;
+            if c.0 % (1 << 20) == 0 {
+                let mut v: Vec<(String, u64)> = c.1.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                v.sort_by_key(|x| std::cmp::Reverse(x.1));
+                v.truncate(10);
+                eprintln!(
+                    "certus: nat trace {:?}: {} non-literal arguments, top {v:?}",
+                    std::thread::current().name(),
+                    c.0
+                );
+                c.1.clear();
+            }
+        });
     }
 
     fn closed_nat_lit_value(&mut self, e: E) -> R<Option<BigUint>> {
@@ -948,8 +1070,14 @@ impl<'a> TC<'a> {
         if args.len() != 2 {
             return Ok(None);
         }
-        let Some(a) = self.nat_lit_value(args[0])? else { return Ok(None) };
-        let Some(b) = self.nat_lit_value(args[1])? else { return Ok(None) };
+        let Some(a) = self.nat_lit_value(args[0])? else {
+            self.trace_nat(args[0]);
+            return Ok(None);
+        };
+        let Some(b) = self.nat_lit_value(args[1])? else {
+            self.trace_nat(args[1]);
+            return Ok(None);
+        };
         let small = |x: &BigUint| x.to_u64().filter(|&v| v <= 1 << 24);
         let r = match op {
             NatOp::Add => a + b,
@@ -1135,19 +1263,19 @@ impl<'a> TC<'a> {
             }
             match (self.delta_rank(t), self.delta_rank(s)) {
                 (None, None) => return Ok(Lazy::Stuck(t, s)),
-                (Some(_), None) => t = self.unfold(t).expect("delta"),
-                (None, Some(_)) => s = self.unfold(s).expect("delta"),
+                (Some(_), None) => t = self.unfold(t)?.expect("delta"),
+                (None, Some(_)) => s = self.unfold(s)?.expect("delta"),
                 (Some((n1, r1)), Some((n2, r2))) => {
                     if r1 > r2 {
-                        t = self.unfold(t).expect("delta");
+                        t = self.unfold(t)?.expect("delta");
                     } else if r2 > r1 {
-                        s = self.unfold(s).expect("delta");
+                        s = self.unfold(s)?.expect("delta");
                     } else {
                         if n1 == n2 && self.same_head_args_eq(t, s)? {
                             return Ok(Lazy::Done(true));
                         }
-                        t = self.unfold(t).expect("delta");
-                        s = self.unfold(s).expect("delta");
+                        t = self.unfold(t)?.expect("delta");
+                        s = self.unfold(s)?.expect("delta");
                     }
                 }
             }

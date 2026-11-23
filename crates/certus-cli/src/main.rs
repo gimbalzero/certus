@@ -146,7 +146,7 @@ fn load_hashed(path: &str) -> Result<(Env, hash::Hash), String> {
 /// `r` itself, or, for a path ending in `.zst`, its zstd-decompressed
 /// contents (streamed: the export is never unpacked to disk or memory).
 /// Windows up to 2 GB are accepted, as `zstd --long=31` writes.
-fn decompress<'a, R: Read + 'a>(path: &str, r: R) -> Result<Box<dyn Read + 'a>, String> {
+fn decompress<'a, R: Read + Send + 'a>(path: &str, r: R) -> Result<Box<dyn Read + Send + 'a>, String> {
     if !path.ends_with(".zst") {
         return Ok(Box::new(r));
     }
@@ -340,6 +340,7 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
     let mut jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut cache_dir = default_cache_dir();
     let mut report: Option<String> = None;
+    let mut stream = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--report" {
@@ -355,11 +356,19 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
             cache_dir = Some(it.next().ok_or("--cache needs a directory")?.into());
         } else if a == "--no-cache" {
             cache_dir = None;
+        } else if a == "--stream" {
+            stream = true;
         } else {
             names.push(a.clone());
         }
     }
     let names = &names[..];
+    if stream {
+        if !names.is_empty() || report.is_some() {
+            return Err("--stream checks the whole export, without --report".into());
+        }
+        return stream_check(path, jobs);
+    }
     let mut cache = cache_dir.and_then(VerdictCache::open);
     // A report needs the parsed export, so it skips the whole-export shortcut.
     if let Some(c) = cache.as_ref().filter(|_| report.is_none()) {
@@ -437,6 +446,33 @@ fn check_cmd(path: &str, args: &[String]) -> Result<Result<(), String>, String> 
         println!("{} of them known good from the verdict cache", r.from_cache);
     }
     println!("term nodes: {}; Nat operations verified for native arithmetic: {}", r.term_nodes, r.native_nat_ops);
+    for (n, t) in &r.slowest {
+        println!("  {:>9.3} ms  {n}", t.as_secs_f64() * 1e3);
+    }
+    Ok(Ok(()))
+}
+
+/// `certus check --stream`: the whole export, read twice and never held
+/// (see `certus_kernel::stream`).
+fn stream_check(path: &str, jobs: usize) -> Result<Result<(), String>, String> {
+    let open = || -> Result<Box<dyn std::io::BufRead + Send>, String> {
+        let f = File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        Ok(Box::new(BufReader::with_capacity(1 << 22, decompress(path, f)?)))
+    };
+    let r = match certus_kernel::stream::check_stream(&open, jobs) {
+        Ok(r) => r,
+        Err(e) if e.resource => return Ok(Err(format!("DECLINED {e} (no verdict: out of resources)"))),
+        Err(e) => return Err(format!("REJECTED {e}")),
+    };
+    let kinds: Vec<String> = r.by_kind.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    println!(
+        "OK: {} declarations type-checked in {:.3} s on {} threads, streaming ({})",
+        r.checked,
+        r.time.as_secs_f64(),
+        r.threads,
+        kinds.join(", ")
+    );
+    println!("peak term nodes: {}; Nat operations verified for native arithmetic: {}", r.term_nodes, r.native_nat_ops);
     for (n, t) in &r.slowest {
         println!("  {:>9.3} ms  {n}", t.as_secs_f64() * 1e3);
     }

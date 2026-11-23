@@ -219,6 +219,19 @@ impl Store {
         s
     }
 
+    /// The store a [`Frozen`] was made from, once nothing else shares it.
+    pub fn unfreeze(f: Frozen) -> Result<Store, Frozen> {
+        match Arc::try_unwrap(f.0) {
+            Ok(own) => {
+                let mut s = Self::on_tables(Arc::new(Tables::default()));
+                s.own = own;
+                s.zero = s.level(Level::Zero);
+                Ok(s)
+            }
+            Err(a) => Err(Frozen(a)),
+        }
+    }
+
     /// Freeze this store, so that other stores can share its objects. Only a
     /// store without a base can be frozen.
     pub fn freeze(self) -> Frozen {
