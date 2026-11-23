@@ -528,6 +528,32 @@ const GENUINE_NAT_OPS: &[(&str, &[(&str, &str)])] = &[
             ("Nat.pow", "c594a43937f7c2b1b392748209c03145c56b9cb3d53dc75767690b9445bcc826"),
         ],
     ),
+    // Lean 4.33.1 (the release the Riemann Hypothesis formalisation of
+    // 20 Nov 2026 was built with): from the Init library inside its statement
+    // export `challenge.ndjson` (Mathlib v4.33.1 only, sha256 bd484ac9...,
+    // published at https://math.mit.edu/~drew/grh/), checked independently by
+    // con-leche, con-ron, nanoda and Lean's kernel. Seven of these definitions
+    // are unchanged since 4.36.0's below.
+    (
+        "4.33.1",
+        &[
+            ("Nat.add", "f8ef476856ad3603f71be6defdc47a8fe84e89168f558ab70ab10fbd47fa6196"),
+            ("Nat.sub", "ffcb51b009dbf289d364bb885865c42daed866f79bb9330fb387998506ab84ed"),
+            ("Nat.mul", "ad719d942f5cbd7b67f78c701a84cf8d26fb3dea917f592abe6a53528b13c09d"),
+            ("Nat.div", "4b68989d0e452511e335239c4a3e18ef014a96dd74c0d4652cae18e3f4fa0b54"),
+            ("Nat.mod", "49dff33979e45e3417e9d49ada3d828ebe11e24dc718fe7521294eea71f8768d"),
+            ("Nat.gcd", "50dc3d757e9421505ab2357c7643d09db58c0bf266aa80fa396dfcd7fc8150c2"),
+            ("Nat.beq", "6fe74250c23139bd43e4804a7bb4fbcf042accb06252329683c33e37e6fb2db4"),
+            ("Nat.ble", "100b9da55221cb1691f37b545928402dc81d629c049b65176de2e0a89116d508"),
+            ("Nat.land", "787448ff948b6a30882c7c891390f70d77340c3a6c8ebb049096786fbfb47b15"),
+            ("Nat.lor", "6a993113405efc756cd49ba3424a948090603081948fb882c0848bfcff9ecf83"),
+            ("Nat.xor", "20464d83b5733903905c9c217d1080b5f0787160f4d9dce517dd82e84859ca22"),
+            ("Nat.shiftLeft", "5fb4c94d70a84775689546fc75340265c0e8bfcafc77d8e295ad3fdb6d152f52"),
+            ("Nat.shiftRight", "205eee2cd9c5d7889855aa1af7cade35e60456224e229cd6ffefd9722b3760b4"),
+            ("Nat.pow", "11c1ab2525a089ebb908656fefe5916dfbf38390bcd040231abf2ab3c1a3a700"),
+            ("Nat.log2", "b17e5dabf611311db22001ef2e95c70a50a9ad28f8a2b0a7c05ed259cf46fef6"),
+        ],
+    ),
     // From `leanexport` of `theorem t : Nat.<op> .. = .. := rfl` for every
     // operation (identical in the Arena live exports and `sum_explicit.cert`).
     (

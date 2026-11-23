@@ -47,7 +47,8 @@ USAGE:
         Write a minimal certificate: the named declarations plus everything
         they depend on, as a standalone export file.
 
-Exports come from lean4export (format 3.x).";
+Exports come from lean4export (format 3.x). A path ending in .zst is read
+through zstd, without unpacking it.";
 
 use certus_core::report::STANDARD_AXIOMS;
 
@@ -93,7 +94,7 @@ fn main() -> ExitCode {
 fn load(path: &str) -> Result<Env, String> {
     let t = Instant::now();
     let f = File::open(path).map_err(|e| format!("{path}: {e}"))?;
-    let env = parse(BufReader::with_capacity(1 << 20, f)).map_err(|e| format!("{path}: {e}"))?;
+    let env = parse(BufReader::with_capacity(1 << 20, decompress(path, f)?)).map_err(|e| format!("{path}: {e}"))?;
     let secs = t.elapsed().as_secs_f64();
     eprintln!(
         "parsed {} lines ({:.1} MB) in {:.2} s: {:.0} MB/s, {:.2}M records/s",
@@ -121,7 +122,9 @@ fn load_hashed(path: &str) -> Result<(Env, hash::Hash), String> {
         }
         *h.finalize().as_bytes()
     });
-    let mut r = BufReader::with_capacity(1 << 20, Tee { inner: f, tx });
+    // The hash covers the file's bytes as stored (compressed, for `.zst`), so
+    // that it matches `hash_file`.
+    let mut r = BufReader::with_capacity(1 << 20, decompress(path, Tee { inner: f, tx })?);
     let env = parse(&mut r).map_err(|e| format!("{path}: {e}"));
     // Hash whatever the parser did not need to read, too.
     let rest = std::io::copy(&mut r, &mut std::io::sink()).map_err(|e| format!("{path}: {e}"));
@@ -138,6 +141,18 @@ fn load_hashed(path: &str) -> Result<(Env, hash::Hash), String> {
         env.lines as f64 / 1e6 / secs
     );
     Ok((env, bytes))
+}
+
+/// `r` itself, or, for a path ending in `.zst`, its zstd-decompressed
+/// contents (streamed: the export is never unpacked to disk or memory).
+/// Windows up to 2 GB are accepted, as `zstd --long=31` writes.
+fn decompress<'a, R: Read + 'a>(path: &str, r: R) -> Result<Box<dyn Read + 'a>, String> {
+    if !path.ends_with(".zst") {
+        return Ok(Box::new(r));
+    }
+    let mut d = zstd::stream::read::Decoder::new(r).map_err(|e| format!("{path}: {e}"))?;
+    d.window_log_max(31).map_err(|e| format!("{path}: {e}"))?;
+    Ok(Box::new(d))
 }
 
 /// A reader that sends a copy of everything read through it to a hasher.
