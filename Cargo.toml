@@ -17,6 +17,7 @@ num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
 rustc-hash = "2"
+hashbrown = { version = "0.15", default-features = false }
 
 [profile.release]
 lto = "thin"

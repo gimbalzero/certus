@@ -594,8 +594,10 @@ pub fn parse<R: BufRead>(reader: R) -> Result<Env, ParseError> {
     parse_jobs(reader, std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
-/// Bytes of input each thread decodes per batch.
-const BATCH_PER_THREAD: usize = 1 << 20;
+/// Bytes of input each thread decodes per batch. Larger batches are no faster
+/// and use more memory (records decoded on one thread and linked on another
+/// fragment the heap).
+const BATCH_PER_THREAD: usize = 1 << 16;
 
 /// One line of a batch, decoded: its line number within the batch, and the
 /// record or why it is not one.
@@ -799,9 +801,12 @@ impl Builder {
                 let e = match e {
                     Expr::BVar(i) => Expr::BVar(i),
                     Expr::Sort(l) => Expr::Sort(self.level(l)?),
-                    Expr::Const { name, levels } => {
-                        let levels = levels.iter().map(|&l| self.level(l)).collect::<Result<Vec<_>, _>>()?;
-                        Expr::Const { name: self.name(name)?, levels: levels.into_boxed_slice() }
+                    Expr::Const { name, mut levels } => {
+                        // In place: no new allocation per constant.
+                        for l in levels.iter_mut() {
+                            *l = self.level(*l)?;
+                        }
+                        Expr::Const { name: self.name(name)?, levels }
                     }
                     Expr::App { f, a } => Expr::App { f: self.expr(f)?, a: self.expr(a)? },
                     Expr::Lam { name, ty, body, bi } => {
