@@ -1,0 +1,279 @@
+{
+ "meta": {
+  "mathlib": "fc4f59e577feb1a4956671bc04ac18aaaf8cd842",
+  "lean": "v4.36.0",
+  "seed": "23",
+  "sample_size": "100",
+  "runner": "ubuntu-latest, 4 vCPU, 16 GB",
+  "run": "https://github.com/gimbalzero/certus/actions/runs/45089250507"
+ },
+ "modules_sampled": 100,
+ "modules_elaborated": 100,
+ "profiled_total_s": 284.99476461,
+ "group_totals_s": {
+  "kernel": 14.64723,
+  "typeclass": 48.34082,
+  "linting": 9.0997745,
+  "waiting": 34.990548,
+  "tactics": 44.46208299,
+  "interpretation": 43.12808,
+  "imports": 55.0015,
+  "compilation": 4.0207266,
+  "elaboration": 31.30400252
+ },
+ "shares": {
+  "kernel": {
+   "n": 100,
+   "point": 0.05139473358412021,
+   "lo": 0.03810986386411094,
+   "hi": 0.06724847653960912
+  },
+  "typeclass": {
+   "n": 100,
+   "point": 0.16962002816490968,
+   "lo": 0.1402319258397481,
+   "hi": 0.19620287974530667
+  },
+  "linting": {
+   "n": 100,
+   "point": 0.03192961987372839,
+   "lo": 0.028041093387430847,
+   "hi": 0.03603632174426405
+  },
+  "waiting": {
+   "n": 100,
+   "point": 0.12277610800283535,
+   "lo": 0.0880116783245632,
+   "hi": 0.16023371795214866
+  },
+  "tactics": {
+   "n": 100,
+   "point": 0.15601017461090547,
+   "lo": 0.13418548707105524,
+   "hi": 0.17730553478759292
+  },
+  "interpretation": {
+   "n": 100,
+   "point": 0.15132937638001334,
+   "lo": 0.13369508762341292,
+   "hi": 0.17037600522242718
+  },
+  "imports": {
+   "n": 100,
+   "point": 0.19299126450714488,
+   "lo": 0.16611872379082532,
+   "hi": 0.22628484046825087
+  },
+  "compilation": {
+   "n": 100,
+   "point": 0.01410807179388768,
+   "lo": 0.010856446313233913,
+   "hi": 0.017984115256641134
+  },
+  "elaboration": {
+   "n": 100,
+   "point": 0.10984062308245501,
+   "lo": 0.08827056299812835,
+   "hi": 0.135127720414697
+  }
+ },
+ "kernel_share_of_profile": {
+  "n": 100,
+  "point": 0.05139473358412021,
+  "lo": 0.03810986386411094,
+  "hi": 0.06724847653960912
+ },
+ "kernel_share_excl_imports": {
+  "n": 100,
+  "point": 0.06368547368044597,
+  "lo": 0.047490910325528976,
+  "hi": 0.08285104915694042
+ },
+ "kernel_share_of_cpu": {
+  "n": 100,
+  "point": 0.05744597488371364,
+  "lo": 0.043123979853565274,
+  "hi": 0.073788129056918
+ },
+ "search_share": {
+  "n": 100,
+  "point": 0.47695957915582843,
+  "lo": 0.4511365208017263,
+  "hi": 0.4992762832342826
+ },
+ "elab_wall_s": 163.743,
+ "elab_cpu_s": 254.974,
+ "replay_n": 100,
+ "replay_only_vs_elab_wall": {
+  "n": 100,
+  "point": 0.06720495532633457,
+  "lo": 0.04953522183482652,
+  "hi": 0.08778227625589335
+ },
+ "replay_with_imports_vs_elab_wall": {
+  "n": 100,
+  "point": 0.953913779520346,
+  "lo": 0.8676018317158407,
+  "hi": 1.053163456045809
+ },
+ "replay_only_vs_profiled_kernel": {
+  "n": 100,
+  "point": 0.7512916094032797,
+  "lo": 0.728202687556665,
+  "hi": 0.7772452230266002
+ },
+ "nanoda": {
+  "n": 98,
+  "attempted": 98,
+  "wall_s": 222.477,
+  "cpu_s": 657.547,
+  "elab_wall_s_same_modules": 163.09,
+  "vs_elab_wall": {
+   "n": 98,
+   "point": 1.3641363664234472,
+   "lo": 1.0074382263667523,
+   "hi": 1.75848045521185
+  },
+  "median_wall_s": 0.7785,
+  "max_rss_mb": 427.6
+ },
+ "leanchecker_closure": {
+  "n": 98,
+  "attempted": 98,
+  "wall_s": 1022.059,
+  "cpu_s": 1019.323,
+  "elab_wall_s_same_modules": 163.09,
+  "vs_elab_wall": {
+   "n": 98,
+   "point": 6.266840394873996,
+   "lo": 4.495142564249273,
+   "hi": 8.242575851805784
+  },
+  "median_wall_s": 3.3105,
+  "max_rss_mb": 980.4
+ },
+ "closure_decls": {
+  "n": 98,
+  "median": 6419.5,
+  "max": 53809,
+  "export_mb_median": 30.5034585
+ },
+ "certus": {
+  "attempted": 98,
+  "accepted": 98,
+  "rejected": 0,
+  "other_failure": 0,
+  "rejections": {},
+  "accepted_wall_s": 145.737,
+  "accepted_modules": [
+   "Mathlib.Algebra.Category.ModuleCat.Sheaf.LocallyFree",
+   "Mathlib.Algebra.Category.Ring.Basic",
+   "Mathlib.Algebra.CharP.LocalRing",
+   "Mathlib.Algebra.ContinuedFractions.Computation.ApproximationCorollaries",
+   "Mathlib.Algebra.Field.GeomSum",
+   "Mathlib.Algebra.Group.Commute.Basic",
+   "Mathlib.Algebra.Group.Graph",
+   "Mathlib.Algebra.GroupWithZero.Opposite",
+   "Mathlib.Algebra.Homology.Additive",
+   "Mathlib.Algebra.Homology.DerivedCategory.Fractions",
+   "Mathlib.Algebra.Homology.Embedding.TruncLEHomology",
+   "Mathlib.Algebra.MvPolynomial.Derivation",
+   "Mathlib.Algebra.MvPolynomial.Variables",
+   "Mathlib.Algebra.Notation.Indicator",
+   "Mathlib.Algebra.PresentedMonoid.Basic",
+   "Mathlib.Algebra.Ring.TransferInstance",
+   "Mathlib.Algebra.Star.MonoidHom",
+   "Mathlib.AlgebraicGeometry.Artinian",
+   "Mathlib.AlgebraicGeometry.Birational.Birational",
+   "Mathlib.AlgebraicGeometry.Over",
+   "Mathlib.AlgebraicGeometry.Sites.BigZariski",
+   "Mathlib.AlgebraicTopology.SimplexCategory.Truncated",
+   "Mathlib.AlgebraicTopology.SimplicialSet.CompStruct",
+   "Mathlib.AlgebraicTopology.SimplicialSet.Subcomplex",
+   "Mathlib.Analysis.Asymptotics.Prod",
+   "Mathlib.Analysis.CStarAlgebra.ApproximateUnit",
+   "Mathlib.Analysis.CStarAlgebra.Hom",
+   "Mathlib.Analysis.Calculus.FDeriv.Norm",
+   "Mathlib.Analysis.Complex.IsIntegral",
+   "Mathlib.Analysis.InnerProductSpace.Orthogonal",
+   "Mathlib.Analysis.Normed.Operator.ContinuousLinearMap",
+   "Mathlib.Analysis.SpecialFunctions.Gaussian.PoissonSummation",
+   "Mathlib.CategoryTheory.Adjunction.Reflective",
+   "Mathlib.CategoryTheory.Bicategory.Functor.Cat",
+   "Mathlib.CategoryTheory.Center.Localization",
+   "Mathlib.CategoryTheory.CopyDiscardCategory.Deterministic",
+   "Mathlib.CategoryTheory.Equivalence.Symmetry",
+   "Mathlib.CategoryTheory.Generator.StrongGenerator",
+   "Mathlib.CategoryTheory.Groupoid.FreeGroupoid",
+   "Mathlib.CategoryTheory.Limits.Constructions.LimitsOfProductsAndEqualizers",
+   "Mathlib.CategoryTheory.Limits.Shapes.WideEqualizers",
+   "Mathlib.CategoryTheory.Limits.Types.Pullbacks",
+   "Mathlib.CategoryTheory.Localization.FiniteProducts",
+   "Mathlib.CategoryTheory.Localization.Resolution",
+   "Mathlib.CategoryTheory.MorphismProperty.RetractArgument",
+   "Mathlib.CategoryTheory.Sites.Continuous",
+   "Mathlib.CategoryTheory.Sites.CoproductSheafCondition",
+   "Mathlib.CategoryTheory.Sites.LocalProperties",
+   "Mathlib.CategoryTheory.Sites.Sieves.Basic",
+   "Mathlib.CategoryTheory.SmallObject.TransfiniteCompositionLifting",
+   "Mathlib.CategoryTheory.Triangulated.TStructure.TExact",
+   "Mathlib.Combinatorics.SimpleGraph.Walk.Decomp",
+   "Mathlib.Data.Int.Order.Units",
+   "Mathlib.Data.Multiset.DershowitzManna",
+   "Mathlib.Data.Nat.Choose.Basic",
+   "Mathlib.Data.Rat.Squarefree",
+   "Mathlib.Data.String.Basic",
+   "Mathlib.FieldTheory.IntermediateField.Basic",
+   "Mathlib.FieldTheory.Minpoly.MinpolyDiv",
+   "Mathlib.Geometry.Euclidean.Sphere.PolePolar",
+   "Mathlib.GroupTheory.FreeGroup.CyclicallyReduced",
+   "Mathlib.GroupTheory.GroupAction.SubMulAction.Combination",
+   "Mathlib.LinearAlgebra.AffineSpace.AffineSubspace.Range",
+   "Mathlib.LinearAlgebra.FreeProduct.Basic",
+   "Mathlib.LinearAlgebra.Matrix.Notation",
+   "Mathlib.LinearAlgebra.Pi",
+   "Mathlib.MeasureTheory.Function.LpSpace.DomAct.Basic",
+   "Mathlib.MeasureTheory.Measure.SubFinite",
+   "Mathlib.MeasureTheory.Measure.WithDensity",
+   "Mathlib.ModelTheory.Encoding",
+   "Mathlib.NumberTheory.LSeries.Injectivity",
+   "Mathlib.NumberTheory.LSeries.RiemannZetaLogDeriv",
+   "Mathlib.NumberTheory.LegendreSymbol.GaussEisensteinLemmas",
+   "Mathlib.NumberTheory.Pell",
+   "Mathlib.NumberTheory.Zsqrtd.QuadraticReciprocity",
+   "Mathlib.Order.Completion",
+   "Mathlib.Order.ModularLattice",
+   "Mathlib.RingTheory.DedekindDomain.AdicValuation.Completion",
+   "Mathlib.RingTheory.Finiteness.Subalgebra",
+   "Mathlib.RingTheory.HahnSeries.Binomial",
+   "Mathlib.RingTheory.Ideal.KrullsHeightTheorem",
+   "Mathlib.RingTheory.LocalProperties.Exactness",
+   "Mathlib.RingTheory.RamificationInertia.Ramification",
+   "Mathlib.RingTheory.RegularLocalRing.Defs",
+   "Mathlib.RingTheory.SimpleRing.Defs",
+   "Mathlib.RingTheory.Spectrum.Prime.Homeomorph",
+   "Mathlib.RingTheory.WittVector.Domain",
+   "Mathlib.RingTheory.WittVector.IsPoly",
+   "Mathlib.SetTheory.ZFC.Basic",
+   "Mathlib.Tactic.Determinant.Echelon.Cert",
+   "Mathlib.Tactic.Linter.Multigoal",
+   "Mathlib.Topology.Algebra.Module.ContinuousLinearMap.Invertible",
+   "Mathlib.Topology.Algebra.Monoid.Defs",
+   "Mathlib.Topology.Category.CompHaus.Basic",
+   "Mathlib.Topology.LocallyFinsupp.Pushforward",
+   "Mathlib.Topology.Order.OrderClosedExtr",
+   "Mathlib.Util.CountHeartbeats",
+   "Mathlib.Util.TermReduce"
+  ],
+  "closures_with_nested_inductives": 97,
+  "closures_scanned": 98
+ },
+ "failures": {},
+ "skipped_closure": {},
+ "verdict": {
+  "E1": "passes",
+  "H1_kernel_le_10pct": "holds (whole 95% interval at or below 10%)",
+  "E2_kernel_replay_only": "passes",
+  "E2_replay_with_per_module_imports": "fails"
+ }
+}
