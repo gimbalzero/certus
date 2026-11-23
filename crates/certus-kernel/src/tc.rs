@@ -66,6 +66,15 @@ thread_local! {
     pub static MISSED_PROOF: std::cell::Cell<Option<NameId>> = const { std::cell::Cell::new(None) };
 }
 
+fn trace_defeq_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CERTUS_TRACE_DEFEQ").is_some())
+}
+
+thread_local! {
+    static DEFEQ_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Debugging aid (`CERTUS_TRACE_UNFOLD`): every 4M unfoldings, print the
 /// constants this thread unfolded most (by name id).
 fn trace_unfold(n: NameId) {
@@ -167,11 +176,16 @@ pub struct TC<'a> {
     infer_cache: FxHashMap<E, E>,
     check_cache: FxHashMap<E, E>,
     whnf_core_cache: FxHashMap<E, E>,
+    /// `whnf_core_cheap` (projections reduce their structure without unfolding).
+    whnf_core_cheap_cache: FxHashMap<E, E>,
     whnf_cache: FxHashMap<E, E>,
     /// Recursion past this stack address is refused as a resource error.
     stack_limit: usize,
     eq_cache: FxHashSet<(E, E)>,
     neq_cache: FxHashSet<(E, E)>,
+    /// Pairs of applications of the same definition whose arguments were found
+    /// not to be all equal (see `lazy_delta`).
+    head_args_fail: FxHashSet<(E, E)>,
     /// `nat_lit_value` of open terms: their literal, or `None`.
     nat_open_cache: FxHashMap<E, Option<E>>,
     fuel: u64,
@@ -229,6 +243,7 @@ impl<'a> TC<'a> {
             infer_cache: FxHashMap::default(),
             check_cache: FxHashMap::default(),
             whnf_core_cache: FxHashMap::default(),
+            whnf_core_cheap_cache: FxHashMap::default(),
             whnf_cache: FxHashMap::default(),
             stack_limit: match STACK_LIMIT.with(|l| l.get()) {
                 0 => stack_pos().saturating_sub(UNKNOWN_STACK_BUDGET),
@@ -237,6 +252,7 @@ impl<'a> TC<'a> {
             eq_cache: FxHashSet::default(),
             neq_cache: FxHashSet::default(),
             nat_open_cache: FxHashMap::default(),
+            head_args_fail: FxHashSet::default(),
             fuel: DEFAULT_FUEL,
             gc_kept: 0,
             gc_min: match GC_MIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -665,7 +681,13 @@ impl<'a> TC<'a> {
         // the moment memory is tightest). Entries whose key was kept get new
         // keys; there are few of them, so they are removed and put back.
         let mut rekeyed: Vec<(E, E)> = Vec::new();
-        for c in [&mut self.infer_cache, &mut self.check_cache, &mut self.whnf_core_cache, &mut self.whnf_cache] {
+        for c in [
+            &mut self.infer_cache,
+            &mut self.check_cache,
+            &mut self.whnf_core_cache,
+            &mut self.whnf_core_cheap_cache,
+            &mut self.whnf_cache,
+        ] {
             c.retain(|&k, v| match (fix(k), fix(*v)) {
                 (Some(k2), Some(v2)) if k2 == k => {
                     *v = v2;
@@ -679,7 +701,7 @@ impl<'a> TC<'a> {
             });
             c.extend(rekeyed.drain(..));
         }
-        for c in [&mut self.eq_cache, &mut self.neq_cache] {
+        for c in [&mut self.eq_cache, &mut self.neq_cache, &mut self.head_args_fail] {
             c.retain(|&(a, b)| match (fix(a), fix(b)) {
                 (Some(a2), Some(b2)) if (a2, b2) == (a, b) => true,
                 (Some(a2), Some(b2)) => {
@@ -770,6 +792,94 @@ impl<'a> TC<'a> {
             Kind::Thm { .. } => Some((n, 0)),
             _ => None,
         }
+    }
+
+    /// `whnf_core`, except that a projection's structure is reduced only by
+    /// this function, without unfolding definitions: Lean's
+    /// `whnf_core(e, cheap_rec = false, cheap_proj = true)`, which definitional
+    /// equality uses. Reducing a structure fully to project out one field can
+    /// evaluate far more than the comparison needs (a linear map over ℚ, say);
+    /// `is_def_eq_core` falls back to `whnf_core` when the cheap form is stuck.
+    pub fn whnf_core_cheap(&mut self, e: E) -> R<E> {
+        match self.st.node(e) {
+            Node::BVar(_) | Node::Sort(_) | Node::Pi(..) | Node::Lam(..) | Node::Nat(_) | Node::Str(_) => {
+                return Ok(e);
+            }
+            Node::Const(..) => return Ok(e),
+            Node::FVar(i) => {
+                return match self.lctx[i as usize].1 {
+                    Some(v) => self.whnf_core_cheap(v),
+                    None => Ok(e),
+                };
+            }
+            _ => {}
+        }
+        if let Some(&r) = self.whnf_core_cheap_cache.get(&e) {
+            return Ok(r);
+        }
+        self.burn()?;
+        let r = match self.st.node(e) {
+            Node::Let(_, v, b) => {
+                let x = self.st.instantiate_rev(b, &[v]);
+                self.whnf_core_cheap(x)?
+            }
+            Node::App(..) => {
+                let (f, args) = self.st.spine(e);
+                let f2 = self.whnf_core_cheap(f)?;
+                if let Node::Lam(..) = self.st.node(f2) {
+                    let mut m = 0;
+                    let mut cur = f2;
+                    while m < args.len() {
+                        match self.st.node(cur) {
+                            Node::Lam(_, b) => {
+                                cur = b;
+                                m += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    let body = self.st.instantiate_rev(cur, &args[..m]);
+                    let r = self.st.apps(body, &args[m..]);
+                    self.whnf_core_cheap(r)?
+                } else if f2 == f {
+                    match self.reduce_rec(e)? {
+                        Some(r) => self.whnf_core_cheap(r)?,
+                        None => e,
+                    }
+                } else {
+                    let r = self.st.apps(f2, &args);
+                    self.whnf_core_cheap(r)?
+                }
+            }
+            Node::Proj(_, idx, s) => {
+                let w = self.whnf_core_cheap(s)?;
+                let (h, args) = self.st.spine(w);
+                let field = match self.st.node(h) {
+                    Node::Const(c, _) => match self.get_const(c).map(|c| c.kind.clone()) {
+                        Some(Kind::Ctor { num_params, .. }) => args.get((num_params + idx) as usize).copied(),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match field {
+                    Some(r) => self.whnf_core_cheap(r)?,
+                    None => e,
+                }
+            }
+            _ => unreachable!(),
+        };
+        self.whnf_core_cheap_cache.insert(e, r);
+        Ok(r)
+    }
+
+    /// `e` reduced, if it is a projection applied to arguments that reduces
+    /// (without unfolding `e`'s head, which is not a definition).
+    fn reduce_proj_app(&mut self, e: E) -> R<Option<E>> {
+        if !matches!(self.st.node(self.st.head(e)), Node::Proj(..)) {
+            return Ok(None);
+        }
+        let r = self.whnf_core(e)?;
+        Ok((r != e).then_some(r))
     }
 
     fn reduce_proj(&mut self, idx: u32, s: E) -> R<Option<E>> {
@@ -1158,7 +1268,32 @@ impl<'a> TC<'a> {
         if self.neq_cache.contains(&key) {
             return Ok(false);
         }
-        let r = self.is_def_eq_core(a, b)?;
+        let traced = trace_defeq_on();
+        let t0 = traced.then(std::time::Instant::now);
+        if traced {
+            DEFEQ_DEPTH.with(|d| d.set(d.get() + 1));
+        }
+        let r = self.is_def_eq_core(a, b);
+        if let Some(t0) = t0 {
+            let depth = DEFEQ_DEPTH.with(|d| {
+                d.set(d.get() - 1);
+                d.get()
+            });
+            let secs = t0.elapsed().as_secs_f64();
+            if secs > 2.0 {
+                let head = |e: E| match self.st.node(self.st.head(e)) {
+                    Node::Const(n, _) => format!("#{n}"),
+                    n => format!("{n:?}").chars().take(12).collect(),
+                };
+                eprintln!(
+                    "certus: defeq depth {depth}: {} =?= {} took {secs:.1} s -> {:?}",
+                    head(a),
+                    head(b),
+                    r.as_ref().ok()
+                );
+            }
+        }
+        let r = r?;
         if r {
             self.eq_cache.insert(key);
         } else {
@@ -1215,8 +1350,8 @@ impl<'a> TC<'a> {
             let tb = self.infer(b, false)?;
             return self.is_def_eq(ta, tb);
         }
-        let a1 = self.whnf_core(a)?;
-        let b1 = self.whnf_core(b)?;
+        let a1 = self.whnf_core_cheap(a)?;
+        let b1 = self.whnf_core_cheap(b)?;
         if (a1 != a || b1 != b)
             && let Some(r) = self.quick_def_eq(a1, b1)?
         {
@@ -1233,6 +1368,11 @@ impl<'a> TC<'a> {
                 return Ok(true);
             }
             _ => {}
+        }
+        // Stuck on cheap forms: reduce projections fully and try again.
+        let (t2, s2) = (self.whnf_core(t)?, self.whnf_core(s)?);
+        if t2 != t || s2 != s {
+            return self.is_def_eq(t2, s2);
         }
         if self.def_eq_app(t, s)? {
             return Ok(true);
@@ -1255,32 +1395,56 @@ impl<'a> TC<'a> {
     fn lazy_delta(&mut self, mut t: E, mut s: E) -> R<Lazy> {
         loop {
             self.burn()?;
-            if let Some(t2) = self.reduce_nat(t)? {
-                return Ok(Lazy::Done(self.is_def_eq(t2, s)?));
-            }
-            if let Some(s2) = self.reduce_nat(s)? {
-                return Ok(Lazy::Done(self.is_def_eq(t, s2)?));
+            // Native arithmetic only on closed terms here, as Lean and nanoda
+            // do: probing open ones at every unfolding step costs far more
+            // than it finds (`whnf` still computes open ones that reduce).
+            if !self.st.info(t).has_fvar && !self.st.info(s).has_fvar {
+                if let Some(t2) = self.reduce_nat(t)? {
+                    return Ok(Lazy::Done(self.is_def_eq(t2, s)?));
+                }
+                if let Some(s2) = self.reduce_nat(s)? {
+                    return Ok(Lazy::Done(self.is_def_eq(t, s2)?));
+                }
             }
             match (self.delta_rank(t), self.delta_rank(s)) {
                 (None, None) => return Ok(Lazy::Stuck(t, s)),
-                (Some(_), None) => t = self.unfold(t)?.expect("delta"),
-                (None, Some(_)) => s = self.unfold(s)?.expect("delta"),
+                // A projection application on the other side is reduced first
+                // (as Lean and nanoda do): that is usually far cheaper than
+                // unfolding the definition.
+                (Some(_), None) => match self.reduce_proj_app(s)? {
+                    Some(s2) => s = s2,
+                    None => t = self.unfold(t)?.expect("delta"),
+                },
+                (None, Some(_)) => match self.reduce_proj_app(t)? {
+                    Some(t2) => t = t2,
+                    None => s = self.unfold(s)?.expect("delta"),
+                },
                 (Some((n1, r1)), Some((n2, r2))) => {
                     if r1 > r2 {
                         t = self.unfold(t)?.expect("delta");
                     } else if r2 > r1 {
                         s = self.unfold(s)?.expect("delta");
                     } else {
-                        if n1 == n2 && self.same_head_args_eq(t, s)? {
-                            return Ok(Lazy::Done(true));
+                        // Same definition on both sides: compare the arguments
+                        // before unfolding, as Lean and nanoda do, only for
+                        // regular definitions (abbreviations are unfolded
+                        // straight away) and never twice for the same pair.
+                        // Otherwise a failing comparison, then unfolding, then
+                        // the same at every level below, is exponential.
+                        let regular = r1 != 0 && r1 != u64::MAX;
+                        if n1 == n2 && regular && !self.head_args_fail.contains(&(t, s)) {
+                            if self.same_head_args_eq(t, s)? {
+                                return Ok(Lazy::Done(true));
+                            }
+                            self.head_args_fail.insert((t, s));
                         }
                         t = self.unfold(t)?.expect("delta");
                         s = self.unfold(s)?.expect("delta");
                     }
                 }
             }
-            t = self.whnf_core(t)?;
-            s = self.whnf_core(s)?;
+            t = self.whnf_core_cheap(t)?;
+            s = self.whnf_core_cheap(s)?;
             if let Some(r) = self.quick_def_eq(t, s)? {
                 return Ok(Lazy::Done(r));
             }
