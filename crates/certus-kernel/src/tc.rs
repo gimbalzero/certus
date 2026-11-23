@@ -202,7 +202,7 @@ impl<'a> TC<'a> {
     /// One unit of work. Every recursive step of inference, reduction and
     /// definitional equality goes through here, so this also guards the stack:
     /// recursion that gets too deep is a resource error, never an overflow.
-    fn burn(&mut self) -> R<()> {
+    pub(crate) fn burn(&mut self) -> R<()> {
         if stack_pos() < self.stack_limit {
             return Err(KError::Resource(
                 "out of stack (term or definitional-equality check nested too deeply)".into(),
