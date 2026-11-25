@@ -214,6 +214,10 @@ struct Checker<'s> {
     times: Vec<(String, Duration)>,
     progress: bool,
     started: Instant,
+    /// Declarations in `todo` left to type-check, and time spent checking
+    /// batches (index 1) and compacting (2), for progress reports.
+    n_todo: usize,
+    phase: [Duration; 3],
     /// Proofs of theorems admitted before this position are kept (the
     /// prelude zone: `Nat` fingerprints cover their closures).
     zone_end: usize,
@@ -333,6 +337,7 @@ impl<'s> Checker<'s> {
             }
             self.batch_names.push(n);
         }
+        self.n_todo += usize::from(todo.is_some());
         self.todo.push(todo.map(|t| Todo { decl: pos, ..t }));
         if let Some((target, path)) = self.extract.clone()
             && name_string(seen.names, d.primary_name()) == target
@@ -380,6 +385,8 @@ impl<'s> Checker<'s> {
         self.batches += 1;
         self.peak_nodes = self.peak_nodes.max(self.st.num_nodes());
         let todo = std::mem::take(&mut self.todo);
+        self.n_todo = 0;
+        let t_check = Instant::now();
         let n_todo = todo.iter().filter(|t| t.is_some()).count();
         let first_failure = self.failure.as_ref().map_or(usize::MAX, |(p, _)| *p);
         let name_of = |n: NameId| name_string(seen.names, n);
@@ -462,15 +469,21 @@ impl<'s> Checker<'s> {
         self.times.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
         self.times.truncate(5);
         self.st = Store::unfreeze(base).unwrap_or_else(|_| panic!("the workers have finished"));
+        let checked_in = t_check.elapsed();
+        let t_compact = Instant::now();
         self.compact();
+        self.phase[1] += checked_in;
+        self.phase[2] += t_compact.elapsed();
         self.batch_pos = self.pos;
         if self.progress {
             eprintln!(
-                "certus: batch {}: {} declarations checked, {} terms kept, {:.1} s",
+                "certus: batch {}: {} declarations checked, {} terms kept, {:.1} s (checking {:.1} s, compacting {:.1} s so far)",
                 self.batches,
                 self.pos,
                 self.persist,
-                self.started.elapsed().as_secs_f64()
+                self.started.elapsed().as_secs_f64(),
+                self.phase[1].as_secs_f64(),
+                self.phase[2].as_secs_f64()
             );
         }
     }
@@ -852,6 +865,8 @@ pub fn check_stream(open: &Open, jobs: usize) -> Result<Report, CheckError> {
         times: Vec::new(),
         progress: std::env::var_os("CERTUS_PROGRESS").is_some(),
         started: start,
+        n_todo: 0,
+        phase: [Duration::ZERO; 3],
         zone_end: usize::MAX,
         extract: std::env::var("CERTUS_EXTRACT")
             .ok()
@@ -900,8 +915,7 @@ pub fn check_stream(open: &Open, jobs: usize) -> Result<Report, CheckError> {
                         c.flush(seen);
                         return Err("stop".into());
                     }
-                    let todos = c.todo.iter().filter(|t| t.is_some()).count();
-                    if todos >= batch_todos || c.st.num_nodes() - c.persist >= BATCH_NODES {
+                    if c.n_todo >= batch_todos || c.st.num_nodes() - c.persist >= BATCH_NODES {
                         c.flush(seen);
                         if c.failure.is_some() {
                             return Err("stop".into());

@@ -176,8 +176,6 @@ pub struct TC<'a> {
     infer_cache: FxHashMap<E, E>,
     check_cache: FxHashMap<E, E>,
     whnf_core_cache: FxHashMap<E, E>,
-    /// `whnf_core_cheap` (projections reduce their structure without unfolding).
-    whnf_core_cheap_cache: FxHashMap<E, E>,
     whnf_cache: FxHashMap<E, E>,
     /// Recursion past this stack address is refused as a resource error.
     stack_limit: usize,
@@ -243,7 +241,6 @@ impl<'a> TC<'a> {
             infer_cache: FxHashMap::default(),
             check_cache: FxHashMap::default(),
             whnf_core_cache: FxHashMap::default(),
-            whnf_core_cheap_cache: FxHashMap::default(),
             whnf_cache: FxHashMap::default(),
             stack_limit: match STACK_LIMIT.with(|l| l.get()) {
                 0 => stack_pos().saturating_sub(UNKNOWN_STACK_BUDGET),
@@ -681,13 +678,7 @@ impl<'a> TC<'a> {
         // the moment memory is tightest). Entries whose key was kept get new
         // keys; there are few of them, so they are removed and put back.
         let mut rekeyed: Vec<(E, E)> = Vec::new();
-        for c in [
-            &mut self.infer_cache,
-            &mut self.check_cache,
-            &mut self.whnf_core_cache,
-            &mut self.whnf_core_cheap_cache,
-            &mut self.whnf_cache,
-        ] {
+        for c in [&mut self.infer_cache, &mut self.check_cache, &mut self.whnf_core_cache, &mut self.whnf_cache] {
             c.retain(|&k, v| match (fix(k), fix(*v)) {
                 (Some(k2), Some(v2)) if k2 == k => {
                     *v = v2;
@@ -792,84 +783,6 @@ impl<'a> TC<'a> {
             Kind::Thm { .. } => Some((n, 0)),
             _ => None,
         }
-    }
-
-    /// `whnf_core`, except that a projection's structure is reduced only by
-    /// this function, without unfolding definitions: Lean's
-    /// `whnf_core(e, cheap_rec = false, cheap_proj = true)`, which definitional
-    /// equality uses. Reducing a structure fully to project out one field can
-    /// evaluate far more than the comparison needs (a linear map over ℚ, say);
-    /// `is_def_eq_core` falls back to `whnf_core` when the cheap form is stuck.
-    pub fn whnf_core_cheap(&mut self, e: E) -> R<E> {
-        match self.st.node(e) {
-            Node::BVar(_) | Node::Sort(_) | Node::Pi(..) | Node::Lam(..) | Node::Nat(_) | Node::Str(_) => {
-                return Ok(e);
-            }
-            Node::Const(..) => return Ok(e),
-            Node::FVar(i) => {
-                return match self.lctx[i as usize].1 {
-                    Some(v) => self.whnf_core_cheap(v),
-                    None => Ok(e),
-                };
-            }
-            _ => {}
-        }
-        if let Some(&r) = self.whnf_core_cheap_cache.get(&e) {
-            return Ok(r);
-        }
-        self.burn()?;
-        let r = match self.st.node(e) {
-            Node::Let(_, v, b) => {
-                let x = self.st.instantiate_rev(b, &[v]);
-                self.whnf_core_cheap(x)?
-            }
-            Node::App(..) => {
-                let (f, args) = self.st.spine(e);
-                let f2 = self.whnf_core_cheap(f)?;
-                if let Node::Lam(..) = self.st.node(f2) {
-                    let mut m = 0;
-                    let mut cur = f2;
-                    while m < args.len() {
-                        match self.st.node(cur) {
-                            Node::Lam(_, b) => {
-                                cur = b;
-                                m += 1;
-                            }
-                            _ => break,
-                        }
-                    }
-                    let body = self.st.instantiate_rev(cur, &args[..m]);
-                    let r = self.st.apps(body, &args[m..]);
-                    self.whnf_core_cheap(r)?
-                } else if f2 == f {
-                    match self.reduce_rec(e)? {
-                        Some(r) => self.whnf_core_cheap(r)?,
-                        None => e,
-                    }
-                } else {
-                    let r = self.st.apps(f2, &args);
-                    self.whnf_core_cheap(r)?
-                }
-            }
-            Node::Proj(_, idx, s) => {
-                let w = self.whnf_core_cheap(s)?;
-                let (h, args) = self.st.spine(w);
-                let field = match self.st.node(h) {
-                    Node::Const(c, _) => match self.get_const(c).map(|c| c.kind.clone()) {
-                        Some(Kind::Ctor { num_params, .. }) => args.get((num_params + idx) as usize).copied(),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                match field {
-                    Some(r) => self.whnf_core_cheap(r)?,
-                    None => e,
-                }
-            }
-            _ => unreachable!(),
-        };
-        self.whnf_core_cheap_cache.insert(e, r);
-        Ok(r)
     }
 
     /// `e` reduced, if it is a projection applied to arguments that reduces
@@ -1350,8 +1263,8 @@ impl<'a> TC<'a> {
             let tb = self.infer(b, false)?;
             return self.is_def_eq(ta, tb);
         }
-        let a1 = self.whnf_core_cheap(a)?;
-        let b1 = self.whnf_core_cheap(b)?;
+        let a1 = self.whnf_core(a)?;
+        let b1 = self.whnf_core(b)?;
         if (a1 != a || b1 != b)
             && let Some(r) = self.quick_def_eq(a1, b1)?
         {
@@ -1368,11 +1281,6 @@ impl<'a> TC<'a> {
                 return Ok(true);
             }
             _ => {}
-        }
-        // Stuck on cheap forms: reduce projections fully and try again.
-        let (t2, s2) = (self.whnf_core(t)?, self.whnf_core(s)?);
-        if t2 != t || s2 != s {
-            return self.is_def_eq(t2, s2);
         }
         if self.def_eq_app(t, s)? {
             return Ok(true);
@@ -1426,13 +1334,11 @@ impl<'a> TC<'a> {
                         s = self.unfold(s)?.expect("delta");
                     } else {
                         // Same definition on both sides: compare the arguments
-                        // before unfolding, as Lean and nanoda do, only for
-                        // regular definitions (abbreviations are unfolded
-                        // straight away) and never twice for the same pair.
-                        // Otherwise a failing comparison, then unfolding, then
-                        // the same at every level below, is exponential.
-                        let regular = r1 != 0 && r1 != u64::MAX;
-                        if n1 == n2 && regular && !self.head_args_fail.contains(&(t, s)) {
+                        // before unfolding, as Lean and nanoda do, but never
+                        // twice for the same pair. Otherwise a failing
+                        // comparison, then unfolding, then the same at every
+                        // level below, is exponential.
+                        if n1 == n2 && !self.head_args_fail.contains(&(t, s)) {
                             if self.same_head_args_eq(t, s)? {
                                 return Ok(Lazy::Done(true));
                             }
@@ -1443,8 +1349,8 @@ impl<'a> TC<'a> {
                     }
                 }
             }
-            t = self.whnf_core_cheap(t)?;
-            s = self.whnf_core_cheap(s)?;
+            t = self.whnf_core(t)?;
+            s = self.whnf_core(s)?;
             if let Some(r) = self.quick_def_eq(t, s)? {
                 return Ok(Lazy::Done(r));
             }
