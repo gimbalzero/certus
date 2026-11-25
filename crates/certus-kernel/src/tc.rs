@@ -60,6 +60,10 @@ impl From<String> for KError {
 /// The value of a theorem whose proof was not kept (see `TC::unfold`).
 pub const DROPPED: E = E(u32::MAX);
 
+/// Work allowed for comparing the arguments of two applications of the same
+/// abbreviation before unfolding it instead (see `TC::lazy_delta`).
+const ABBREV_ARGS_BUDGET: u64 = 1 << 10;
+
 thread_local! {
     /// The last theorem this thread could not unfold because its proof was not
     /// kept (see `TC::unfold`).
@@ -184,6 +188,10 @@ pub struct TC<'a> {
     /// Pairs of applications of the same definition whose arguments were found
     /// not to be all equal (see `lazy_delta`).
     head_args_fail: FxHashSet<(E, E)>,
+    /// A heuristic attempt (see `try_with_budget`) stops when `fuel` falls to
+    /// this; `attempt_aborted` says that is why an error was raised.
+    attempt_floor: u64,
+    attempt_aborted: bool,
     /// `nat_lit_value` of open terms: their literal, or `None`.
     nat_open_cache: FxHashMap<E, Option<E>>,
     fuel: u64,
@@ -250,6 +258,8 @@ impl<'a> TC<'a> {
             neq_cache: FxHashSet::default(),
             nat_open_cache: FxHashMap::default(),
             head_args_fail: FxHashSet::default(),
+            attempt_floor: 0,
+            attempt_aborted: false,
             fuel: DEFAULT_FUEL,
             gc_kept: 0,
             gc_min: match GC_MIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -280,6 +290,10 @@ impl<'a> TC<'a> {
             return Err(KError::Resource(
                 "work budget exhausted (proof too expensive to check, or non-terminating)".into(),
             ));
+        }
+        if self.fuel <= self.attempt_floor {
+            self.attempt_aborted = true;
+            return Err(KError::Resource("budget of a heuristic attempt exhausted".into()));
         }
         self.fuel -= 1;
         Ok(())
@@ -1339,7 +1353,17 @@ impl<'a> TC<'a> {
                         // comparison, then unfolding, then the same at every
                         // level below, is exponential.
                         if n1 == n2 && !self.head_args_fail.contains(&(t, s)) {
-                            if self.same_head_args_eq(t, s)? {
+                            // For a regular definition, as Lean and nanoda do.
+                            // For an abbreviation, only within a small budget:
+                            // comparing its arguments is usually much cheaper
+                            // than unfolding it, but can be hopeless.
+                            let eq = if r1 != u64::MAX {
+                                self.same_head_args_eq(t, s)?
+                            } else {
+                                self.try_with_budget(ABBREV_ARGS_BUDGET, |tc| tc.same_head_args_eq(t, s))?
+                                    .unwrap_or(false)
+                            };
+                            if eq {
                                 return Ok(Lazy::Done(true));
                             }
                             self.head_args_fail.insert((t, s));
@@ -1358,6 +1382,24 @@ impl<'a> TC<'a> {
     }
 
     /// `f.{ls} as =?= f.{ls'} bs` by comparing levels and arguments only.
+    /// Run `f` with at most `budget` units of work. If it runs out, the work
+    /// is abandoned and `None` returned; any other error is passed on. Only for
+    /// heuristics whose failure the caller handles by doing the full work.
+    fn try_with_budget<T>(&mut self, budget: u64, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
+        let old = self.attempt_floor;
+        self.attempt_floor = old.max(self.fuel.saturating_sub(budget));
+        let r = f(self);
+        self.attempt_floor = old;
+        match r {
+            Err(KError::Resource(_)) if self.attempt_aborted && self.fuel > old => {
+                self.attempt_aborted = false;
+                Ok(None)
+            }
+            Err(e) => Err(e),
+            Ok(v) => Ok(Some(v)),
+        }
+    }
+
     fn same_head_args_eq(&mut self, t: E, s: E) -> R<bool> {
         let (f, xs) = self.st.spine(t);
         let (g, ys) = self.st.spine(s);
